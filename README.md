@@ -95,20 +95,23 @@ Set per-webhook `priority_threshold` to gate alert noise. Threshold `10.0`
 catches dev/staging on auth surface; `15.0` catches only when stack tech or
 multiple signals also stack.
 
-## Deep scan
+## Rock-turning (deep scanning)
 
-Heuristic scoring tells you *where to look*. Deep-scan tells you *what to
-report*. [src/deepscan.py](src/deepscan.py) runs four focused probes against
-the live URLs found by the monitor and emits `DeepScanFinding` records with
+Heuristic scoring tells you *where to look*. Rock-turning tells you *what to
+report*. [src/rocks.py](src/rocks.py) runs six focused probes against the
+live URLs found by the monitor and emits `DeepScanFinding` records with
 severity + copy-pasteable evidence — the kind triagers can't argue down to
-"input validation issue."
+"input validation issue." Inspired by the Armitage Hail-Mary philosophy:
+throw every reasonable check at every live target, surface the hits, move on.
 
 | Probe | What it catches |
 |-------|-----------------|
-| **path-sweep** | `.git/HEAD`, `.env`, `/actuator/heapdump`, `/actuator/env`, `/h2-console`, exposed Swagger/OpenAPI, `/examples/` (Tomcat), `/server-status`, etc. Compares each response against a learned 404-sentinel fingerprint so 200-instead-of-404 vhost wrappers don't false-positive. Strict per-signal Content-Type checks reject empty-body and HTML-wrapper matches. |
+| **path-sweep** | `.git/HEAD`, `.env`, `/actuator/heapdump`, `/actuator/env`, `/h2-console`, exposed Swagger/OpenAPI, `/examples/` (Tomcat), `/server-status`, etc. Compares each response against a learned **404-sentinel fingerprint** so 200-instead-of-404 vhost wrappers don't false-positive. Strict per-signal Content-Type checks reject empty-body and HTML-wrapper matches. |
 | **bypass-403** | Header tricks against every URL that responded 403: `X-Forwarded-For: 127.0.0.1`, `X-Original-URL: /`, `X-HTTP-Method-Override: GET`, etc. Status-change → finding. |
 | **cors-reflect** | Sends `Origin: https://evil.example.com` and `Origin: null` to every 2xx; flags credentialed reflection (high) and wildcard-with-creds (medium). |
 | **tomcat-fingerprint** | Detects Tomcat via `/docs/`, extracts the version, cross-references the 9.x CVE band table (CVE-2025-24813 down through GhostCat). Also tests **PUT writability** non-destructively (PUT a sentinel file, GET-verify, DELETE if accepted) — when writable on Tomcat ≤ 9.0.98 that satisfies the CVE-2025-24813 RCE precondition. |
+| **wayback-historical** | Pulls historical URLs from `web.archive.org/cdx` for each base's host (zero traffic to the target), then re-probes a sample of interesting paths (`/admin`, `/api`, `/.git`, `/dump`, etc.) against the live host. Surfaces *forgotten endpoints* — retired admin panels, legacy API consoles — that normal recon misses because they're not linked anywhere. |
+| **js-secret-mine** | Fetches each 200 HTML page, follows `<script src=>` references, greps the JS bundles for hardcoded credentials (AWS keys, GitHub PATs, JWT tokens, Google API keys, private-key blocks, `password=`/`api_key=` literals) and internal-hostname/RFC1918-IP disclosures. Capped at 60 JS bundles to bound traffic. |
 
 Each finding carries a `severity` from the standard ladder (`critical/high/
 medium/low/info`) and an `evidence` field with the raw HTTP excerpt. Use it
@@ -116,11 +119,11 @@ from the CLI:
 
 ```bash
 # Run against a program's live findings already in the DB
-bb-sentinel deepscan --program evilcorp --min-severity medium
+bb-sentinel rocks --program evilcorp --min-severity medium
 
 # Or against any httpx-style JSONL of probe results (from a one-off scan)
-bb-sentinel deepscan --from-jsonl data/evilcorp-live.jsonl --min-severity high \
-  --out data/evilcorp-deep.jsonl --limit 50
+bb-sentinel rocks --from-jsonl data/evilcorp-live.jsonl --min-severity high \
+  --out data/evilcorp-rocks.jsonl --limit 50
 ```
 
 Severity weights (`critical=50, high=25, medium=10, low=4, info=1`) are
@@ -136,8 +139,8 @@ bb-sentinel scan <program> [--force]
 bb-sentinel findings <program> --since 24h [--min-score 7]
 bb-sentinel status
 bb-sentinel run                # foreground monitor loop
-bb-sentinel deepscan --program <name> [--min-severity medium]
-bb-sentinel deepscan --from-jsonl <file.jsonl> [--min-severity high]
+bb-sentinel rocks --program <name> [--min-severity medium]
+bb-sentinel rocks --from-jsonl <file.jsonl> [--min-severity high]
 ```
 
 Invoke as `python -m src.cli ...` (or install the package and use the

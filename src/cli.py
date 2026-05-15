@@ -17,7 +17,7 @@ from sqlalchemy import desc, select
 
 from .config import AppConfig
 from .database import Asset, Database, Finding, Program, ScanRun, utcnow
-from .deepscan import DeepScanner, SEVERITY_ORDER
+from .rocks import DeepScanner, SEVERITY_ORDER
 from .monitor import MonitorLoop, ProgramScanner
 
 
@@ -242,14 +242,14 @@ async def run(ctx: click.Context, tick: int) -> None:
               type=click.Choice(list(SEVERITY_ORDER)))
 @click.option("--limit", default=80, show_default=True, type=int,
               help="Cap number of findings to print (file output is uncapped).")
-@click.option("--out", "out_path", default="data/deepscan.jsonl", show_default=True,
+@click.option("--out", "out_path", default="data/rocks.jsonl", show_default=True,
               help="JSONL file to write all findings to.")
 @click.pass_context
 @_coro
-async def deepscan(ctx: click.Context, from_jsonl: str | None, program_name: str | None,
-                   concurrency: int, timeout: float, min_severity: str, limit: int,
-                   out_path: str) -> None:
-    """Run impact-focused probes (paths/bypass/CORS/Tomcat-CVE) against live URLs."""
+async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | None,
+                concurrency: int, timeout: float, min_severity: str, limit: int,
+                out_path: str) -> None:
+    """Turn over every rock — impact-focused probes (paths/bypass/CORS/Tomcat-CVE/wayback/js-mine) against live URLs."""
     import json as _json
     import pathlib
 
@@ -282,10 +282,10 @@ async def deepscan(ctx: click.Context, from_jsonl: str | None, program_name: str
     else:
         raise click.UsageError("supply --from-jsonl FILE or --program NAME")
 
-    click.echo(f"loaded {len(probes)} probe records → running deep scan")
+    click.echo(f"loaded {len(probes)} probe records → turning rocks")
     scanner = DeepScanner(concurrency=concurrency, timeout=timeout)
     findings = await scanner.scan(probes)
-    click.echo(f"deepscan produced {len(findings)} findings")
+    click.echo(f"rocks produced {len(findings)} findings")
 
     min_idx = SEVERITY_ORDER.index(min_severity)
     filtered = [f for f in findings if SEVERITY_ORDER.index(f.severity) <= min_idx]
