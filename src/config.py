@@ -37,6 +37,11 @@ class ProgramConfig(BaseModel):
     scan_frequency: str = "1h"
     webhooks: list[WebhookConfig] = Field(default_factory=list)
     enabled: bool = True
+    # Compliance pre-flight inputs (see src/compliance.py). Either url OR text path.
+    rules_url: str | None = None
+    rules_text: str | None = None
+    # Manual override after the operator has reviewed the program rules.
+    compliance_override: bool = False
 
     @field_validator("domains")
     @classmethod
