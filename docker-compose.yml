@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-bb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-bb}
+      POSTGRES_DB: ${POSTGRES_DB:-bb_sentinel}
+    volumes:
+      - bb_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bb} -d ${POSTGRES_DB:-bb_sentinel}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sentinel:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      BB_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-bb}:${POSTGRES_PASSWORD:-bb}@postgres:5432/${POSTGRES_DB:-bb_sentinel}
+      BB_REDIS_URL: redis://redis:6379/0
+      BB_PROGRAMS_CONFIG: /app/config/programs.yaml
+      BB_GLOBAL_CONFIG: /app/config/global.yaml
+      SLACK_WEBHOOK_EXAMPLE_PROGRAM: ${SLACK_WEBHOOK_EXAMPLE_PROGRAM:-}
+      SLACK_WEBHOOK_ATT: ${SLACK_WEBHOOK_ATT:-}
+    volumes:
+      - ./config:/app/config:ro
+      - bb_nuclei:/root/nuclei-templates
+    restart: unless-stopped
+
+volumes:
+  bb_pg:
+  bb_nuclei:

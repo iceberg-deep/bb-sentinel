@@ -1,0 +1,31 @@
+# bb-sentinel — never commit user-specific config or runtime state
+config/programs.yaml
+config/global.yaml
+config/*.inscope
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Data / logs
+*.log
+*.sqlite
+*.sqlite3
+data/
