@@ -130,6 +130,79 @@ Severity weights (`critical=50, high=25, medium=10, low=4, info=1`) are
 exposed for any external scoring layer that wants to combine these with the
 heuristic priority above.
 
+## Compliance pre-flight — don't get your account banned
+
+Most bug-bounty programs include explicit anti-automation language in their
+rules (Bugcrowd's VRT flags "Excessive Use of Automated Tools," many H1
+program briefs list named scanners as out-of-scope, etc.). Running bb-sentinel
+against a program that prohibits automated scanning gets the researcher's
+account banned and can create TOS/CFAA exposure. [src/compliance.py](src/compliance.py)
+is a pre-flight check that reads the program's posted rules text and decides
+whether automation is likely allowed **before** the scan runs.
+
+| Verdict | Meaning |
+|---------|---------|
+| `BLOCK` | Explicit prohibition without a covering allowance. `scan` / `rocks` refuse to start. |
+| `WARN`  | Ambiguous, contradictory, or "prior written consent" language. Prompts the operator. |
+| `UNCLEAR` | Rules page silent, or couldn't be fetched (JS-rendered, etc.). Prompts the operator. Paste the rules to a file and use `rules_text` to get a real verdict. |
+| `OK` | Explicit allowance for automated tooling. |
+
+What the checker greps for (case-insensitive, multi-pattern):
+
+```
+PROHIBITED → "no automated scanning/tools/testing"
+             "manual testing only"
+             "automated vulnerability scanners are prohibited"
+             "do not run automated"
+             "prior written consent/approval/authorization"
+             named scanners (nuclei, nikto, nessus, qualys, acunetix, burp, zap)
+             "DoS / denial-of-service / DDoS"
+             "volumetric / excessive requests"
+             "brute-force testing"
+             "no fuzzing"
+
+PERMITTED  → "automated scanning is allowed/permitted/welcome"
+             "nuclei templates welcome/accepted"
+             "automated scanners are allowed"
+
+RATE-LIMIT → "rate limit", explicit RPS values, "throttle",
+             "respect/observe/honor our limits", "reasonable use"
+```
+
+Configure per program in `programs.yaml`:
+
+```yaml
+programs:
+  evilcorp:
+    domains: [evilcorp.com]
+    inscope_config: /app/config/evilcorp.scope
+    # Compliance pre-flight inputs — either url OR text file
+    rules_url: https://bugcrowd.com/engagements/evilcorp
+    # Or paste the rules text into a file when the policy page is JS-rendered
+    # rules_text: /app/config/evilcorp.rules.txt
+    # Override AFTER you've read the rules yourself
+    # compliance_override: true
+```
+
+Use the standalone command for a one-off check:
+
+```bash
+bb-sentinel compliance --url https://bugcrowd.com/engagements/something
+bb-sentinel compliance --file path/to/pasted-rules.txt
+bb-sentinel compliance --program evilcorp        # pulls from programs.yaml
+```
+
+The pre-flight runs automatically before `bb-sentinel scan <program>` and
+`bb-sentinel rocks --program <name>`. To skip after manual review:
+
+```bash
+bb-sentinel scan evilcorp --ignore-compliance     # one-off
+bb-sentinel scan evilcorp --yes                   # auto-confirm WARN/UNCLEAR
+```
+
+This is *tooling* — not legal advice. The operator is still responsible for
+reading the actual program terms.
+
 ## Target curation — picking what to point bb-sentinel at
 
 Half the battle is **choosing a program where your reports will actually be
@@ -186,6 +259,8 @@ bb-sentinel status
 bb-sentinel run                # foreground monitor loop
 bb-sentinel rocks --program <name> [--min-severity medium]
 bb-sentinel rocks --from-jsonl <file.jsonl> [--min-severity high]
+bb-sentinel compliance --url <rules-url>
+bb-sentinel compliance --program <name>
 ```
 
 Invoke as `python -m src.cli ...` (or install the package and use the

@@ -15,6 +15,7 @@ import structlog
 import yaml
 from sqlalchemy import desc, select
 
+from .compliance import ComplianceCheck, check_file as compliance_check_file, check_url as compliance_check_url
 from .config import AppConfig
 from .database import Asset, Database, Finding, Program, ScanRun, utcnow
 from .rocks import DeepScanner, SEVERITY_ORDER
@@ -125,17 +126,64 @@ def program_list(ctx: click.Context) -> None:
         click.echo(f"{name:20} domains={','.join(cfg.domains)} freq={cfg.scan_frequency} enabled={cfg.enabled}")
 
 
+async def _preflight_compliance(cfg, ignore: bool, assume_yes: bool) -> None:
+    """Pre-flight check: read program rules + decide whether automation is OK.
+
+    Reads `rules_url` and/or `rules_text` from the program config. If neither is
+    set, we cannot assess — emits an UNCLEAR warning and (unless --yes) prompts.
+    """
+    if ignore:
+        click.echo("[compliance] override flag set — skipping pre-flight (you own this)")
+        return
+    if getattr(cfg, "compliance_override", False):
+        click.echo("[compliance] program has compliance_override=true in config — skipping")
+        return
+    rules_url = getattr(cfg, "rules_url", None)
+    rules_text_path = getattr(cfg, "rules_text", None)
+    check: ComplianceCheck | None = None
+    if rules_text_path:
+        try:
+            check = compliance_check_file(rules_text_path)
+        except Exception as e:
+            click.echo(f"[compliance] failed to read rules_text {rules_text_path}: {e}", err=True)
+    elif rules_url:
+        click.echo(f"[compliance] fetching rules from {rules_url} ...")
+        check = await compliance_check_url(rules_url)
+    else:
+        click.echo("[compliance] no rules_url or rules_text configured — UNCLEAR")
+        check = ComplianceCheck(source="<no source>", verdict="UNCLEAR",
+                                fetch_error="program config has neither rules_url nor rules_text")
+    if check is None:
+        return
+    click.echo("─" * 60)
+    click.echo(check.render())
+    click.echo("─" * 60)
+    if check.is_blocking():
+        raise click.ClickException(
+            "Compliance pre-flight: BLOCK. Refusing to run automated probes against "
+            "a program with explicit anti-automation language. Override with "
+            "--ignore-compliance only after manual review."
+        )
+    if check.needs_confirmation() and not assume_yes:
+        click.confirm(f"Compliance verdict is {check.verdict}. Proceed anyway?", abort=True)
+
+
 @cli.command()
 @click.argument("program_name")
 @click.option("--force", is_flag=True, help="Run immediately regardless of schedule")
+@click.option("--ignore-compliance", is_flag=True,
+              help="Skip the compliance pre-flight (you take responsibility)")
+@click.option("--yes", "-y", is_flag=True, help="Auto-confirm WARN/UNCLEAR verdicts")
 @click.pass_context
 @_coro
-async def scan(ctx: click.Context, program_name: str, force: bool) -> None:
+async def scan(ctx: click.Context, program_name: str, force: bool,
+               ignore_compliance: bool, yes: bool) -> None:
     """Run a one-off scan for a single program."""
     app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
     cfg = app.programs.get(program_name)
     if not cfg:
         raise click.ClickException(f"unknown program: {program_name}")
+    await _preflight_compliance(cfg, ignore_compliance, yes)
     db = Database(app.global_.database_url)
     await db.create_all()
     try:
@@ -144,6 +192,33 @@ async def scan(ctx: click.Context, program_name: str, force: bool) -> None:
         click.echo(json.dumps(stats.to_dict(), indent=2))
     finally:
         await db.dispose()
+
+
+@cli.command()
+@click.option("--url", "url", default=None, help="Fetch and assess a rules URL")
+@click.option("--file", "path", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Assess a pasted rules-text file (use this when the policy page is JS-rendered)")
+@click.option("--program", "program_name", default=None,
+              help="Pull rules_url / rules_text from this program's config")
+@click.pass_context
+@_coro
+async def compliance(ctx: click.Context, url: str | None, path: str | None,
+                     program_name: str | None) -> None:
+    """Standalone compliance check — read program rules and decide if automation is OK."""
+    if program_name:
+        app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
+        cfg = app.programs.get(program_name)
+        if not cfg: raise click.ClickException(f"unknown program: {program_name}")
+        url = getattr(cfg, "rules_url", None) or url
+        path = getattr(cfg, "rules_text", None) or path
+    if not url and not path:
+        raise click.UsageError("supply --url URL, --file PATH, or --program NAME")
+    check = compliance_check_file(path) if path else await compliance_check_url(url)  # type: ignore[arg-type]
+    click.echo(check.render())
+    if check.is_blocking():
+        raise SystemExit(2)
+    if check.needs_confirmation():
+        raise SystemExit(1)
 
 
 @cli.command()
@@ -244,14 +319,25 @@ async def run(ctx: click.Context, tick: int) -> None:
               help="Cap number of findings to print (file output is uncapped).")
 @click.option("--out", "out_path", default="data/rocks.jsonl", show_default=True,
               help="JSONL file to write all findings to.")
+@click.option("--ignore-compliance", is_flag=True,
+              help="Skip the compliance pre-flight (you take responsibility)")
+@click.option("--yes", "-y", is_flag=True, help="Auto-confirm WARN/UNCLEAR verdicts")
 @click.pass_context
 @_coro
 async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | None,
                 concurrency: int, timeout: float, min_severity: str, limit: int,
-                out_path: str) -> None:
+                out_path: str, ignore_compliance: bool, yes: bool) -> None:
     """Turn over every rock — impact-focused probes (paths/bypass/CORS/Tomcat-CVE/wayback/js-mine) against live URLs."""
     import json as _json
     import pathlib
+
+    # Pre-flight compliance check when running against a configured program
+    if program_name:
+        app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
+        cfg = app.programs.get(program_name)
+        if cfg is None:
+            raise click.ClickException(f"unknown program: {program_name}")
+        await _preflight_compliance(cfg, ignore_compliance, yes)
 
     probes: list[dict] = []
     if from_jsonl:
