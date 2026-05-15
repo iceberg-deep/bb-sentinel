@@ -2,6 +2,8 @@
 config/programs.yaml
 config/global.yaml
 config/*.inscope
+config/*.scope
+!config/example-program.scope
 .env
 .env.*
 !.env.example

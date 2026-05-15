@@ -55,7 +55,14 @@ class NucleiTech(Discoverer):
         ]
         rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(urls).encode())
         if rc != 0 and not stdout:
-            log.error("nuclei failed", rc=rc, stderr=stderr.decode(errors="replace")[:300])
+            err = stderr.decode(errors="replace")
+            if "no templates" in err.lower() or "no templates provided" in err.lower():
+                log.warning(
+                    "nuclei templates not installed — skipping tech enrichment. "
+                    "Run `nuclei -update-templates` to enable.",
+                )
+            else:
+                log.error("nuclei failed", rc=rc, stderr=err[:300])
             return out
 
         for line in stdout.decode(errors="replace").splitlines():

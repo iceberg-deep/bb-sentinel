@@ -19,8 +19,12 @@ class Subfinder(Discoverer):
             result.errors.append(f"{self.binary_path} not found on PATH")
             return result
 
-        cmd = [self.binary_path, "-silent", "-all", "-nW", "-dL", "-"]
-        rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(domains).encode())
+        # subfinder takes `-d a,b,c` for inline domains (no stdin support — `-dL`
+        # expects a file path, not `-`). -nW drops wildcard DNS noise. We avoid
+        # `-all` since it queries 30+ sources (many slow or key-gated) and blows
+        # past sane scan budgets; the default ~6 sources cover most of the value.
+        cmd = [self.binary_path, "-silent", "-nW", "-duc", "-timeout", "20", "-d", ",".join(domains)]
+        rc, stdout, stderr = await self._run_cmd(cmd)
         if rc != 0:
             result.errors.append(f"subfinder rc={rc}: {stderr.decode(errors='replace').strip()[:300]}")
             return result
