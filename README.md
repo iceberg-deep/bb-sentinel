@@ -50,13 +50,13 @@ cp config/global.example.yaml   config/global.yaml
 
 ```yaml
 programs:
-  example-program:
-    domains: [example.com, example-program.com, sprint.com]
-    inscope_config: /app/config/example-program.inscope
+  evilcorp:
+    domains: [evilcorp.com, evilcorp.io]
+    inscope_config: /app/config/evilcorp.inscope
     scan_frequency: 1h
     webhooks:
       - url: https://hooks.slack.com/services/...
-        priority_threshold: 7.0
+        priority_threshold: 10.0
 ```
 
 `config/global.yaml` controls the database URL, log level, concurrency, and
@@ -65,16 +65,35 @@ expansion.
 
 ## Priority scoring
 
-`score = base × multipliers`, capped at 25. Multipliers stack:
+`score = base × multipliers`, capped at **50**. Each signal contributes at most
+one multiplier; multipliers stack on the base score in fixed order. See
+[src/scoring.py](src/scoring.py) for the complete token sets.
 
-| Signal                                              | Multiplier |
-|-----------------------------------------------------|------------|
-| URL contains admin/api/staging/test/dev/etc.        | ×3         |
-| Tech stack includes Spring Boot/Laravel/Django/Rails | ×2         |
-| Port in {8080, 9090, 3000, 4000, 5000, 8443, …}     | ×2.5       |
-| Discovered in the last 6 hours                      | ×2         |
+| Signal                                                                                       | Multiplier |
+|----------------------------------------------------------------------------------------------|------------|
+| **URL keyword** — `admin`, `api`, `staging`, `dev`, `qa`, `qat`, `uat`, `preprod`, `internal`, `swagger`, `graphql`, `actuator`, `metrics`, `debug`, `jenkins`, `gitlab`, etc. | **×3.0** |
+| **Auth surface** — `account`, `auth`, `sso`, `oauth`, `login`, `signin`, `idp`, `identity`, `okta`, `saml`, `mfa`, `2fa`, etc. | **×2.5** |
+| **Real-app tech** — Spring/Django/Rails/Laravel/Express/Tomcat or ops tooling (Kubernetes, AppDynamics, Jenkins, GitLab, Elasticsearch, Vault, Consul, …) | **×2.0** |
+| **Stack depth** — ≥2 interesting techs after stripping CDN/TLS/jQuery/analytics noise        | **×1.3**   |
+| **Interesting port** — `{8080, 9090, 3000, 4000, 5000, 8443, 8081, 8000, 8888, 9000, 7001, 9200, 5601}` | **×2.5** |
+| **Recency** — discovered in the last 6 hours                                                 | **×2.0**   |
 
-Set per-webhook `priority_threshold` to gate alert noise.
+Base score: `0.7`, +0.3 if the probe returned a 2xx/3xx. Worked example —
+`api-staging.evilcorp.com` running Spring Boot + MySQL, just discovered,
+returns 200:
+
+```
+base 1.0  × 3.0 (keyword: api, staging)  × 2.0 (tech: spring)
+          × 1.3 (stack-depth: spring + mysql)  × 2.0 (recent <6h)
+        = 15.60
+```
+
+An auth-context dev env scores higher — `account-dev.evilcorp.com` returning
+200 with no detected tech: `1.0 × 3.0 (dev) × 2.5 (account) × 2.0 (recent) = 15.00`.
+
+Set per-webhook `priority_threshold` to gate alert noise. Threshold `10.0`
+catches dev/staging on auth surface; `15.0` catches only when stack tech or
+multiple signals also stack.
 
 ## CLI
 
@@ -95,12 +114,12 @@ Invoke as `python -m src.cli ...` (or install the package and use the
 ```json
 {
   "timestamp": "2026-05-14T22:30:00Z",
-  "program": "example-program",
+  "program": "evilcorp",
   "assets": [
     {
-      "url": "https://api-staging.example-program.com/v2/users",
+      "url": "https://api-staging.evilcorp.com/v2/users",
       "technologies": ["Spring Boot", "MySQL"],
-      "priority_score": 8.5,
+      "priority_score": 15.6,
       "inscope_verified": true,
       "status_code": 200,
       "title": null,
