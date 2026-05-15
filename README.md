@@ -130,6 +130,51 @@ Severity weights (`critical=50, high=25, medium=10, low=4, info=1`) are
 exposed for any external scoring layer that wants to combine these with the
 heuristic priority above.
 
+## Target curation — picking what to point bb-sentinel at
+
+Half the battle is **choosing a program where your reports will actually be
+accepted**, not just finding bugs. [scripts/build_signal_list.py](scripts/build_signal_list.py)
+pulls the latest public-program dumps from `arkadiyt/bounty-targets-data` for
+Bugcrowd, Intigriti, and YesWeHack, applies a signal-build heuristic, and
+emits a ranked target list:
+
+```bash
+python3 scripts/build_signal_list.py
+# → data/signal-build-targets.md  (human-readable, 60 rows)
+# → data/signal-build-targets.json (machine-readable, 287+ programs)
+```
+
+The heuristic weights what actually matters when grinding rep from zero:
+
+| Signal | Weight | Why |
+|--------|-------:|-----|
+| Allows public disclosure | **+30** | Writeups build portfolio-level signal independent of any platform's reputation score |
+| Payout band **$1k-$8k** | +25 | Real money but not whale-tier prestige where the strongest hunters camp |
+| Scope **2-6 in-scope assets** | +20 | Smaller surface = less competition + room for deep focus |
+| Payout band **$500-$1k** | +10 | Smaller checks but valid ROI |
+| USD currency | +10 | (Configurable; US-based default) |
+| Scope **7-12** assets | +15 | Bigger surface still tractable |
+| Full safe-harbor (Bugcrowd) | +5  | Explicit legal coverage |
+
+### HackerOne is deliberately excluded
+
+H1 has a **trial-report mechanism** that locks accounts across the entire
+platform when:
+
+1. You've used your ~5 trial submissions
+2. Your existing reports haven't been *Resolved* yet (signal stays "Still
+   being determined")
+
+In that state, every H1 program rejects new submissions — **even
+`Signal Required: 0` VDPs**. This isn't a per-program gate; it's an
+account-level gate that no program-side setting can bypass. The H1
+Signal score also gets pushed *negative* when triage closes reports as
+Informative or N/A, so the loop hardens against you.
+
+Until existing trial reports clear, H1 is dead surface and bb-sentinel
+should be pointed at Bugcrowd / Intigriti / YesWeHack instead. The
+curation script reflects this and skips H1 entirely.
+
 ## CLI
 
 ```
