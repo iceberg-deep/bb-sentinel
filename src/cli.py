@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ def _load_app(programs_path: str, global_path: str) -> AppConfig:
 
 
 def _coro(fn):
+    @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         return asyncio.run(fn(*args, **kwargs))
     return wrapper

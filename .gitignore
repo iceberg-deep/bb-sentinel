@@ -2,6 +2,8 @@
 config/programs.yaml
 config/global.yaml
 config/*.inscope
+config/*.scope
+!config/tmobile.scope
 .env
 .env.*
 !.env.example
