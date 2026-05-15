@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -57,6 +58,24 @@ UNIQUE_TECH_THRESHOLD = 2
 RECENCY_WINDOW_HOURS = 6.0
 BASE_SCORE = 0.7
 MAX_SCORE = 50.0
+
+
+def _compile_token_re(tokens: tuple[str, ...]) -> re.Pattern[str]:
+    """Match each token at word boundaries, allowing trailing digits.
+
+    Trailing digits matter for env-naming: `dev6`, `qa01`, `eui1` should match
+    `dev` / `qa` / `eui`-class keywords. Boundaries are required so `idp`
+    doesn't match inside `apidprod` and `api` doesn't match inside `capital`.
+    Longest tokens are tried first so multi-word entries like 'spring boot'
+    win over the bare 'spring' inside the same input.
+    """
+    parts = sorted({re.escape(t) for t in tokens}, key=len, reverse=True)
+    return re.compile(r"\b(?:" + "|".join(parts) + r")\d*\b", re.IGNORECASE)
+
+
+_KEYWORD_RE = _compile_token_re(KEYWORD_TOKENS)
+_AUTH_RE = _compile_token_re(AUTH_TOKENS)
+_TECH_RE = _compile_token_re(TECH_TOKENS)
 
 
 @dataclass
@@ -117,21 +136,17 @@ def score_finding(
 
     breakdown = ScoreBreakdown(score=score, base=score)
 
-    matched_keywords = [k for k in KEYWORD_TOKENS if k in url_lc]
+    matched_keywords = sorted(set(_KEYWORD_RE.findall(url_lc)))
     if matched_keywords:
         breakdown.matched_keywords = matched_keywords
         score *= KEYWORD_MULTIPLIER
 
-    matched_auth = [k for k in AUTH_TOKENS if k in url_lc]
+    matched_auth = sorted(set(_AUTH_RE.findall(url_lc)))
     if matched_auth:
         breakdown.matched_auth = matched_auth
         score *= AUTH_MULTIPLIER
 
-    matched_tech: list[str] = []
-    for token in TECH_TOKENS:
-        for t in tech_lc:
-            if token in t and token not in matched_tech:
-                matched_tech.append(token)
+    matched_tech = sorted({m for t in tech_lc for m in _TECH_RE.findall(t)})
     if matched_tech:
         breakdown.matched_tech = matched_tech
         score *= TECH_MULTIPLIER
