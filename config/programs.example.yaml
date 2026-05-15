@@ -1,0 +1,29 @@
+# bb-sentinel programs configuration
+#
+# Each entry under `programs:` defines a bug-bounty target program. Domains must
+# be public, in-scope roots authorized by the program. The `inscope_config` file
+# should hold the program's scope rules (one regex/host per line) — bb-sentinel
+# pipes discovered hosts through the `inscope` CLI to enforce them.
+
+programs:
+  tmobile:
+    domains:
+      - t-mobile.com
+      - tmobile.com
+      - sprint.com
+    inscope_config: /app/config/tmobile.inscope
+    scan_frequency: 1h
+    webhooks:
+      - name: slack-primary
+        url: ${SLACK_WEBHOOK_TMOBILE}
+        priority_threshold: 7.0
+
+  att:
+    domains:
+      - att.com
+    inscope_config: /app/config/att.inscope
+    scan_frequency: 2h
+    webhooks:
+      - name: slack-secondary
+        url: ${SLACK_WEBHOOK_ATT:-}
+        priority_threshold: 5.0

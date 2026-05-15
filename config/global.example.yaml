@@ -1,0 +1,20 @@
+# Global configuration. Values may reference env vars as ${VAR} or ${VAR:-default}.
+
+database_url: ${BB_DATABASE_URL:-postgresql+psycopg://bb:bb@postgres:5432/bb_sentinel}
+redis_url: ${BB_REDIS_URL:-redis://redis:6379/0}
+
+concurrency: 4           # max programs scanned in parallel
+httpx_threads: 50
+nuclei_concurrency: 25
+
+log_level: INFO
+user_agent: bb-sentinel/0.1
+crtsh_timeout: 30
+webhook_timeout: 15
+
+tool_paths:
+  subfinder: subfinder
+  assetfinder: assetfinder
+  httpx: httpx
+  nuclei: nuclei
+  inscope: inscope
