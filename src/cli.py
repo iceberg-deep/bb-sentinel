@@ -17,6 +17,7 @@ from sqlalchemy import desc, select
 
 from .config import AppConfig
 from .database import Asset, Database, Finding, Program, ScanRun, utcnow
+from .deepscan import DeepScanner, SEVERITY_ORDER
 from .monitor import MonitorLoop, ProgramScanner
 
 
@@ -228,6 +229,86 @@ async def run(ctx: click.Context, tick: int) -> None:
         await loop.run_forever(tick_seconds=tick)
     finally:
         await db.dispose()
+
+
+@cli.command()
+@click.option("--from-jsonl", "from_jsonl", type=click.Path(exists=True, dir_okay=False),
+              help="Read live URLs from an httpx-style JSONL file (one probe per line).")
+@click.option("--program", "program_name", default=None,
+              help="Pull live URLs for this program from the DB instead of a JSONL file.")
+@click.option("--concurrency", default=8, show_default=True, type=int)
+@click.option("--timeout", default=8.0, show_default=True, type=float)
+@click.option("--min-severity", default="info", show_default=True,
+              type=click.Choice(list(SEVERITY_ORDER)))
+@click.option("--limit", default=80, show_default=True, type=int,
+              help="Cap number of findings to print (file output is uncapped).")
+@click.option("--out", "out_path", default="data/deepscan.jsonl", show_default=True,
+              help="JSONL file to write all findings to.")
+@click.pass_context
+@_coro
+async def deepscan(ctx: click.Context, from_jsonl: str | None, program_name: str | None,
+                   concurrency: int, timeout: float, min_severity: str, limit: int,
+                   out_path: str) -> None:
+    """Run impact-focused probes (paths/bypass/CORS/Tomcat-CVE) against live URLs."""
+    import json as _json
+    import pathlib
+
+    probes: list[dict] = []
+    if from_jsonl:
+        for line in pathlib.Path(from_jsonl).read_text().splitlines():
+            if line.strip():
+                probes.append(_json.loads(line))
+    elif program_name:
+        app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
+        db = Database(app.global_.database_url)
+        try:
+            prog = await db.get_program(program_name)
+            if not prog:
+                raise click.ClickException(f"program {program_name!r} not in DB")
+            async with db.session() as s:
+                stmt = (select(Finding, Asset)
+                        .join(Asset, Finding.asset_id == Asset.id)
+                        .where(Asset.program_id == prog.id))
+                res = await s.execute(stmt)
+                for f, a in res.all():
+                    probes.append({
+                        "url": f.url, "host": a.hostname,
+                        "port": (f.ports or [None])[0],
+                        "status_code": f.status_code,
+                        "title": f.title, "technologies": f.technologies or [],
+                    })
+        finally:
+            await db.dispose()
+    else:
+        raise click.UsageError("supply --from-jsonl FILE or --program NAME")
+
+    click.echo(f"loaded {len(probes)} probe records → running deep scan")
+    scanner = DeepScanner(concurrency=concurrency, timeout=timeout)
+    findings = await scanner.scan(probes)
+    click.echo(f"deepscan produced {len(findings)} findings")
+
+    min_idx = SEVERITY_ORDER.index(min_severity)
+    filtered = [f for f in findings if SEVERITY_ORDER.index(f.severity) <= min_idx]
+    filtered.sort(key=lambda f: SEVERITY_ORDER.index(f.severity))
+
+    # Write full output to disk
+    pathlib.Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as fh:
+        for f in findings:
+            fh.write(_json.dumps({
+                "url": f.url, "probe": f.probe, "signal": f.signal,
+                "severity": f.severity, "title": f.title,
+                "evidence": f.evidence[:500], "extra": f.extra,
+            }) + "\n")
+    click.echo(f"wrote {out_path}")
+
+    # Print top N to stdout for the operator
+    for f in filtered[:limit]:
+        click.echo(f"  [{f.severity.upper():>8}] {f.signal:<28}  {f.url}")
+        if f.title and f.title != f.signal:
+            click.echo(f"             title: {f.title}")
+    if len(filtered) > limit:
+        click.echo(f"  ... +{len(filtered) - limit} more (see {out_path})")
 
 
 def main() -> None:
