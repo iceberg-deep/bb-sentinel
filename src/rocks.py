@@ -500,9 +500,212 @@ def _semver_le(a: str, b: str) -> bool:
     return pa <= pb
 
 
+class WaybackHistorical(DeepScanProbe):
+    """Pull historical URLs from web.archive.org's CDX index for each base's
+    host, then re-probe a bounded sample against the live host. Anything that
+    *still* returns 200 with content is a forgotten endpoint — legacy admin
+    panels, retired API docs, abandoned dev consoles. These are exactly the
+    surface monitors miss because they no longer appear in normal recon.
+
+    Zero traffic to the target during CDX lookup; the re-probe is light
+    (bounded sample, deduplicated).
+    """
+    name = "wayback-historical"
+    CDX_BASE = "http://web.archive.org/cdx/search/cdx"
+    MAX_PATHS_PER_HOST = 200
+    # Paths whose mere existence is worth flagging as a finding (vs just a lead)
+    INTERESTING_TOKENS = (
+        "/admin", "/api", "/internal", "/console", "/manage", "/debug",
+        "/swagger", "/graphql", "/actuator", "/private", "/_internal",
+        "/upload", "/download", "/backup", "/dump", "/.git", "/.env",
+        "/sql", "/phpinfo", "/server-status", "/server-info",
+    )
+
+    async def _cdx(self, host: str) -> list[str]:
+        try:
+            r = await self.client.get(self.CDX_BASE, params={
+                "url": f"{host}/*",
+                "output": "json", "collapse": "urlkey", "fl": "original",
+                "limit": str(self.MAX_PATHS_PER_HOST),
+            }, timeout=30)
+            if r.status_code != 200: return []
+            rows = r.json()
+            return [row[0] for row in rows[1:]] if isinstance(rows, list) and len(rows) > 1 else []
+        except Exception:
+            return []
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        # Group input by hostname so we issue one CDX query per host
+        from urllib.parse import urlparse as _urlparse
+        host_to_base: dict[str, str] = {}
+        for p in probes:
+            url = p.get("url", "")
+            host = _urlparse(url).netloc
+            if host and host not in host_to_base:
+                host_to_base[host] = url
+        log.info("wayback", hosts=len(host_to_base))
+        # 1) CDX pull per host
+        cdx_results = await asyncio.gather(*(self._cdx(h) for h in host_to_base.keys()))
+        findings: list[DeepScanFinding] = []
+        # 2) Re-probe each historical URL against the current host
+        for (host, base), urls in zip(host_to_base.items(), cdx_results):
+            interesting = []
+            for u in urls:
+                path = _urlparse(u).path
+                if not path or path == "/": continue
+                if any(tok in path.lower() for tok in self.INTERESTING_TOKENS):
+                    interesting.append(path)
+            interesting = list(dict.fromkeys(interesting))[:50]  # cap per host
+
+            async def reprobe(p: str):
+                full = base.rstrip("/") + p
+                r = await self._get(full, follow=False)
+                if r is None or r.status_code not in (200, 206, 401):
+                    return None
+                body_l = (r.content[:512] or b"").lower()
+                if b"<title>404" in body_l or b"page not found" in body_l:
+                    return None
+                # Skip empty bodies — fallback or just gone
+                if len(r.content) < 32 and r.status_code != 401:
+                    return None
+                # Skip very small redirects-as-200 (some servers do this)
+                sev = "low"
+                if "/admin" in p.lower() or "/api" in p.lower():
+                    sev = "medium"
+                if "/.git" in p.lower() or "/.env" in p.lower() or "/dump" in p.lower():
+                    sev = "high"
+                return DeepScanFinding(
+                    url=full, probe=self.name,
+                    signal="historical-url-still-live",
+                    severity=sev,
+                    title=f"Wayback-historical path {p} still serves content",
+                    evidence=(r.text or "")[:300],
+                    extra={"status": r.status_code, "length": len(r.content),
+                           "historical-source": u,
+                           "content-type": r.headers.get("content-type","")},
+                )
+            for f in await asyncio.gather(*(reprobe(p) for p in interesting)):
+                if f is not None:
+                    findings.append(f)
+        return findings
+
+
+class JsSecretMine(DeepScanProbe):
+    """Fetch each 200 HTML page, extract <script src=> URLs, fetch JS bundles,
+    grep for hardcoded secrets and high-value endpoint strings. Output:
+      - Secret hits (per pattern) → severity = pattern-specific
+      - Internal-hostname / private-IP disclosures → info/low
+      - Endpoint candidates that look API-ish → info (leads, not bugs)
+    """
+    name = "js-secret-mine"
+    MAX_JS_BUNDLES = 60  # global cap across all input URLs
+
+    SECRET_PATTERNS: tuple[tuple[str, str, str], ...] = (
+        # (signal, severity, regex)
+        ("aws-access-key",   "high",     r"AKIA[0-9A-Z]{16}"),
+        ("aws-secret-key",   "high",     r'(?<![A-Za-z0-9])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9])'),  # very high FP; off by default
+        ("github-pat",       "high",     r"ghp_[A-Za-z0-9]{36}"),
+        ("github-oauth",     "high",     r"gho_[A-Za-z0-9]{36}"),
+        ("slack-token",      "high",     r"xox[bpoas]-[A-Za-z0-9-]{10,48}"),
+        ("private-key",      "critical", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
+        ("google-api-key",   "medium",   r"AIza[0-9A-Za-z\-_]{35}"),
+        ("jwt-token",        "medium",   r"eyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}"),
+        ("password-literal", "medium",   r'(?i)["\']?password["\']?\s*[:=]\s*["\'][^"\']{6,80}["\']'),
+        ("api-key-literal",  "medium",   r'(?i)["\']?api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{16,}["\']'),
+    )
+    # aws-secret-key is too FP-prone — keep it off by default
+    DISABLED = {"aws-secret-key"}
+
+    SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
+    # RFC1918 IPs + multi-segment internal hostnames. We *exclude* `.test`,
+    # `.dev`, `.prod`, `.stg` because they match minified JS method calls
+    # like `Foo.test()`. Leftmost hostname segment is required to be ≥4 chars
+    # to filter `k.internal` / `i.corp` false positives from one-letter vars.
+    INTERNAL_HOST_RE = re.compile(
+        r'\b(?:'
+        r'10(?:\.\d{1,3}){3}'                                       # 10/8
+        r'|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}'               # 172.16/12
+        r'|192\.168(?:\.\d{1,3}){2}'                                # 192.168/16
+        r'|[a-z0-9][a-z0-9-]{3,}(?:\.[a-z0-9-]{2,})*\.(?:internal|corp|intranet)'
+        r')\b',
+        re.I,
+    )
+
+    async def _fetch(self, url: str) -> tuple[int, str, str]:
+        async with self.sem:
+            try:
+                r = await self.client.get(url, timeout=self.timeout, follow_redirects=True)
+                return r.status_code, r.text or "", r.headers.get("content-type", "")
+            except Exception:
+                return 0, "", ""
+
+    def _resolve_script(self, page_url: str, src: str) -> str:
+        if src.startswith("//"): return "https:" + src
+        if src.startswith("http"): return src
+        from urllib.parse import urlparse
+        parsed = urlparse(page_url)
+        if src.startswith("/"):
+            return f"{parsed.scheme}://{parsed.netloc}{src}"
+        return f"{parsed.scheme}://{parsed.netloc}/{src.lstrip('./')}"
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        targets = [p["url"] for p in probes
+                   if p.get("status_code") and 200 <= p["status_code"] < 400]
+        log.info("js-secret-mine", html_pages=len(targets))
+        findings: list[DeepScanFinding] = []
+        # 1) Fetch pages
+        page_results = await asyncio.gather(*(self._fetch(u) for u in targets))
+        js_urls: list[tuple[str, str]] = []
+        for url, (status, body, ctype) in zip(targets, page_results):
+            if status == 0 or not body: continue
+            # Also scan the HTML body itself for secrets (inline scripts)
+            self._scan_body(url, body, findings, source_kind="inline")
+            for src in self.SCRIPT_SRC_RE.findall(body):
+                js_urls.append((url, self._resolve_script(url, src)))
+        # 2) Dedupe + cap
+        seen_js: set[str] = set()
+        ordered_js: list[tuple[str, str]] = []
+        for page, j in js_urls:
+            if j in seen_js: continue
+            seen_js.add(j); ordered_js.append((page, j))
+            if len(ordered_js) >= self.MAX_JS_BUNDLES: break
+        log.info("js-secret-mine", bundles=len(ordered_js))
+        # 3) Fetch + scan JS
+        js_results = await asyncio.gather(*(self._fetch(j) for _, j in ordered_js))
+        for (page, j_url), (status, body, _ctype) in zip(ordered_js, js_results):
+            if status == 0 or not body: continue
+            self._scan_body(j_url, body, findings, source_kind="js", from_page=page)
+        return findings
+
+    def _scan_body(self, url: str, body: str, out: list, *,
+                    source_kind: str, from_page: str | None = None) -> None:
+        for signal, severity, pattern in self.SECRET_PATTERNS:
+            if signal in self.DISABLED: continue
+            for m in re.findall(pattern, body):
+                if isinstance(m, tuple): m = m[0]
+                out.append(DeepScanFinding(
+                    url=url, probe=self.name,
+                    signal=signal, severity=severity,
+                    title=f"{signal} in {source_kind} at {url}",
+                    evidence=m[:160] if isinstance(m, str) else str(m)[:160],
+                    extra={"source-kind": source_kind, "from-page": from_page},
+                ))
+                break  # one finding per signal per source
+        # Internal hostnames / private IPs — info disclosure (dedupe + cap)
+        for m in sorted(set(self.INTERNAL_HOST_RE.findall(body)))[:5]:
+            out.append(DeepScanFinding(
+                url=url, probe=self.name,
+                signal="internal-hostname-disclosed",
+                severity="low",
+                title=f"Internal hostname/IP referenced in {source_kind}: {m}",
+                evidence=m, extra={"source-kind": source_kind, "from-page": from_page},
+            ))
+
+
 # -- Orchestrator -----------------------------------------------------------
 
-DEFAULT_PROBES = (PathSweep, Bypass403, CorsProbe, TomcatFingerprint)
+DEFAULT_PROBES = (PathSweep, Bypass403, CorsProbe, TomcatFingerprint,
+                  WaybackHistorical, JsSecretMine)
 
 
 class DeepScanner:
@@ -540,6 +743,7 @@ class DeepScanner:
 __all__ = [
     "DeepScanFinding", "DeepScanner", "DeepScanProbe",
     "PathSweep", "Bypass403", "CorsProbe", "TomcatFingerprint",
+    "WaybackHistorical", "JsSecretMine",
     "HIGH_VALUE_PATHS", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
     "SEVERITY_ORDER", "SEVERITY_WEIGHT",
 ]
