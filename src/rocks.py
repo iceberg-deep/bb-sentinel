@@ -801,6 +801,30 @@ class OriginCandidateProbe(DeepScanProbe):
     Doesn't replace Shodan/Censys for serious origin hunting — they index
     full IPv4 space, we only see what's in CT. But it's free, async-safe,
     and catches the easy mistakes.
+
+    DISABLED (2026-05-16). Removed from DEFAULT_PROBES because the
+    "non-big-CDN ASN ⇒ likely origin" heuristic produced 37 FPs in one
+    PlanetHoster run — all candidate IPs sat on PlanetHoster's own ASN
+    (53589), i.e. the target's own infra, not a leaked origin behind a
+    third-party WAF. Findings were also emitted at severity=medium with
+    no verification, inflating Bugcrowd-VRT-P5 noise to apparent mediums.
+
+    Rebuild checklist before re-enabling:
+      1. Same-operator suppression: skip candidates whose ASN matches the
+         primary host's resolved ASN — same org, not a bypass.
+      2. Active verification: GET https://<candidate-ip>/ with
+         Host: <target> and compare to the CDN-fronted response. Drop on
+         response mismatch (default page, unrelated tenant, 4xx without
+         the app shell).
+      3. WAF-behavior probe: send a known-blockable payload through both
+         paths; only emit when the CDN path blocks and the direct path
+         serves. Without behavior divergence there is no bypass.
+      4. Severity tied to verification: verified bypass ⇒ medium;
+         response matches but no WAF divergence ⇒ info (mere origin
+         disclosure); verification inconclusive ⇒ info with note.
+      5. Per-domain dedup: group N hostnames sharing the same candidate
+         IP into one finding, not N.
+      6. Cross-reference Shodan/Censys when available — CT-only is noisy.
     """
     name = "origin-candidate"
 
@@ -940,6 +964,44 @@ class BackupFileProbe(DeepScanProbe):
     leak."""
     name = "backup-file"
 
+    # Source-language file extensions on the *original* URL. A backup of one
+    # of these is potentially a source-disclosure issue.
+    _SOURCE_EXTS = (".php", ".py", ".rb", ".js", ".ts", ".jsx", ".tsx",
+                    ".aspx", ".asp", ".jsp", ".java", ".go", ".cs",
+                    ".cgi", ".pl", ".env", ".config", ".conf")
+    _SOURCE_MARKERS = (
+        b"<?php", b"<?xml", b"<%", b"#!/", b"import ", b"from ",
+        b"function ", b"class ", b"package ", b"def ", b"func ",
+        b"require(", b"require '", b"using ", b"namespace ", b"<jsp:",
+    )
+
+    @classmethod
+    def _grade(cls, original_url: str, body: bytes) -> str:
+        """Severity by what's actually in the body, not just that one exists.
+
+        - Archive / database magic bytes ⇒ high (real backup payload).
+        - Source-language original + source-shaped body ⇒ medium (source
+          disclosure).
+        - Anything else ⇒ low (a backup of a static asset isn't a finding
+          worth medium+ on its own).
+        """
+        # Archive / DB magic bytes — these carry real payloads.
+        if body[:4] == b"PK\x03\x04":            return "high"   # zip / jar
+        if body[:2] == b"\x1f\x8b":              return "high"   # gzip
+        if body[:4] == b"Rar!":                  return "high"   # rar
+        if body[:6] == b"7z\xbc\xaf\x27\x1c":    return "high"   # 7zip
+        if body[:6] == b"SQLite":                return "high"   # sqlite db
+        if body[:5] == b"-- --":                 return "high"   # mysqldump header
+        if body[:14] == b"-- PostgreSQL ":       return "high"   # pg_dump header
+        from urllib.parse import urlparse
+        orig_path = urlparse(original_url).path.lower()
+        is_source_orig = any(orig_path.endswith(e) for e in cls._SOURCE_EXTS)
+        if is_source_orig:
+            sample = body[:300]
+            if any(m in sample for m in cls._SOURCE_MARKERS):
+                return "medium"
+        return "low"
+
     async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
         # Targets: live 200 URLs that look like a specific resource (have
         # a path beyond `/`). Bare-root URLs don't make sense to backup-probe.
@@ -968,14 +1030,16 @@ class BackupFileProbe(DeepScanProbe):
             # Skip if response is text/html (likely 200-fallback for missing file)
             if ctype.startswith("text/html"):
                 return None
+            severity = self._grade(url, body)
             return DeepScanFinding(
                 url=target, probe=self.name,
                 signal=f"exposed-backup{suffix}",
-                severity="high",
+                severity=severity,
                 title=f"Backup-suffix variant returned {r.status_code} ({len(body)} bytes)",
                 evidence=body[:300].decode("utf-8", errors="replace"),
                 extra={"content-type": ctype, "length": len(body),
-                       "suffix": suffix, "original-url": url},
+                       "suffix": suffix, "original-url": url,
+                       "grade-basis": severity},
             )
 
         findings: list[DeepScanFinding] = []
@@ -987,36 +1051,41 @@ class BackupFileProbe(DeepScanProbe):
 
 class MethodEnumProbe(DeepScanProbe):
     """Enumerate uncommon HTTP methods against each live URL. Surfaces:
-      - PUT / DELETE returning 200/201/204 = unauth write (critical)
-      - TRACE returning 200 = XST (low/info)
-      - PROPFIND returning 207 = WebDAV exposed (medium-high)
-      - Custom methods returning non-error = misconfigured proxy
-    Sends one request per (URL, method); ~8 extra requests per host."""
+      - PUT verified via GET-back round-trip = unauth write (high)
+      - PUT returned 2xx but GET-back didn't match = ambiguous (low)
+      - OPTIONS advertising write methods = low (config disclosure)
+      - TRACE returning 200 = XST (low)
+      - PROPFIND returning 207 = WebDAV exposed (medium)
+      - DEBUG / CONNECT returning success = misconfigured proxy (medium)
+
+    DELETE and PATCH are NOT probed bare against live URLs — sending those
+    against an unknown resource risks destructive side effects on production
+    data. PUT writes are aimed at a sentinel sub-path that we DELETE on the
+    way out (mirrors TomcatFingerprint's verified-write approach).
+    """
     name = "method-enum"
-    METHODS = ("OPTIONS", "PUT", "DELETE", "PATCH", "TRACE", "PROPFIND", "CONNECT", "DEBUG")
-    # Methods we care about IF they return success. OPTIONS is informational
-    # (always 200 + Allow header) — surface only the Allow contents.
-    INTERESTING_STATUS = {"PUT": (200, 201, 204),
-                          "DELETE": (200, 204),
-                          "PATCH": (200, 201, 204),
-                          "TRACE": (200,),
+    # Read-only / inspection methods — safe to send against arbitrary URLs.
+    READ_METHODS = ("OPTIONS", "TRACE", "PROPFIND", "DEBUG", "CONNECT")
+    INTERESTING_STATUS = {"TRACE":    (200,),
                           "PROPFIND": (207, 200),
-                          "DEBUG": (200,),
-                          "CONNECT": (200, 405)}  # 405 = method known, could still be probed
+                          "DEBUG":    (200,),
+                          "CONNECT":  (200, 405)}  # 405 = method known
+    PUT_SENTINEL_SUFFIX = "/bb-sentinel-method-probe-DELETE-ME.txt"
+    PUT_SENTINEL_BODY = b"bb-sentinel method-enum write-probe; please delete\n"
 
     async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
         bases = sorted({p["url"] for p in probes
                         if p.get("status_code") and 200 <= p["status_code"] < 400})
-        log.info("method-enum probe", urls=len(bases), methods=len(self.METHODS))
+        log.info("method-enum probe", urls=len(bases),
+                 read_methods=len(self.READ_METHODS))
         findings: list[DeepScanFinding] = []
 
-        async def try_method(url: str, method: str):
+        async def try_read_method(url: str, method: str):
             async with self.sem:
                 try:
                     r = await self.client.request(method, url, timeout=self.timeout)
                 except Exception:
                     return None
-            # OPTIONS: surface Allow header content only if it includes write methods
             if method == "OPTIONS":
                 allow = (r.headers.get("allow") or r.headers.get("Allow") or "").upper()
                 write_methods = [m for m in ("PUT", "DELETE", "PATCH", "MKCOL")
@@ -1030,12 +1099,10 @@ class MethodEnumProbe(DeepScanProbe):
                     evidence=f"Allow: {allow}",
                     extra={"allow": allow, "write-methods": write_methods},
                 )
-            # Other methods: flag if status matches the interesting set
             interesting = self.INTERESTING_STATUS.get(method, ())
             if r.status_code not in interesting:
                 return None
-            sev = "high" if method in ("PUT", "DELETE", "PATCH") else "medium"
-            if method == "TRACE": sev = "low"
+            sev = "low" if method == "TRACE" else "medium"
             return DeepScanFinding(
                 url=url, probe=self.name,
                 signal=f"method-{method.lower()}-accepted",
@@ -1046,7 +1113,52 @@ class MethodEnumProbe(DeepScanProbe):
                        "length": len(r.content)},
             )
 
-        tasks = [try_method(u, m) for u in bases for m in self.METHODS]
+        async def try_put_write(url: str):
+            """PUT a sentinel to a unique sub-path, GET it back to confirm
+            the write took effect, then DELETE for cleanup. high only when
+            the GET-back round-trip verifies; otherwise the 2xx is treated
+            as ambiguous (proxy / framework quirk, not a real write)."""
+            target = url.rstrip("/") + self.PUT_SENTINEL_SUFFIX
+            async with self.sem:
+                try:
+                    put_r = await self.client.request(
+                        "PUT", target, content=self.PUT_SENTINEL_BODY,
+                        headers={"Content-Type": "text/plain"},
+                        timeout=self.timeout,
+                    )
+                    put_status = put_r.status_code
+                except Exception:
+                    return None
+            if put_status not in (200, 201, 204):
+                return None
+            verified = False
+            async with self.sem:
+                try:
+                    g = await self.client.get(target, timeout=self.timeout)
+                    if g.status_code == 200 and self.PUT_SENTINEL_BODY.decode() in (g.text or ""):
+                        verified = True
+                except Exception:
+                    pass
+            async with self.sem:
+                try:
+                    await self.client.request("DELETE", target, timeout=self.timeout)
+                except Exception:
+                    pass
+            return DeepScanFinding(
+                url=target, probe=self.name,
+                signal="method-put-verified" if verified else "method-put-unverified",
+                severity="high" if verified else "low",
+                title=(f"PUT accepted at {target} ({put_status})"
+                       + (" — GET-back verified write"
+                          if verified else " — write NOT verified by GET-back")),
+                evidence=f"PUT → {put_status}; GET-back match = {verified}",
+                extra={"method": "PUT", "put-status": put_status,
+                       "verified-write": verified,
+                       "sentinel-path": self.PUT_SENTINEL_SUFFIX},
+            )
+
+        tasks = [try_read_method(u, m) for u in bases for m in self.READ_METHODS]
+        tasks += [try_put_write(u) for u in bases]
         for f in await asyncio.gather(*tasks):
             if f is not None: findings.append(f)
         return findings
@@ -1114,27 +1226,76 @@ class WaybackHistorical(DeepScanProbe):
                 r = await self._get(full, follow=False)
                 if r is None or r.status_code not in (200, 206, 401):
                     return None
-                body_l = (r.content[:512] or b"").lower()
+                body = r.content or b""
+                body_l = body[:512].lower()
                 if b"<title>404" in body_l or b"page not found" in body_l:
                     return None
                 # Skip empty bodies — fallback or just gone
-                if len(r.content) < 32 and r.status_code != 401:
+                if len(body) < 32 and r.status_code != 401:
                     return None
-                # Skip very small redirects-as-200 (some servers do this)
+                ctype = r.headers.get("content-type", "").lower()
+                p_low = p.lower()
+                # Default: historical URL still serving content is mildly
+                # interesting (low). Path-keyword escalations require the
+                # body shape to match — otherwise it's just a SPA route
+                # that happens to contain `/admin` or a friendly 404 page
+                # whose HTML happens to mention `/.git`.
                 sev = "low"
-                if "/admin" in p.lower() or "/api" in p.lower():
+                is_html = (ctype.startswith("text/html")
+                           or b"<html" in body_l or b"<!doctype html" in body_l)
+                # Tier 1 — admin / API panels. Escalate only on non-HTML
+                # responses OR HTML responses that clearly aren't generic
+                # SPA shells (401 status counts).
+                if ("/admin" in p_low or "/api" in p_low) and (
+                        not is_html or r.status_code == 401):
                     sev = "medium"
-                if "/.git" in p.lower() or "/.env" in p.lower() or "/dump" in p.lower():
-                    sev = "high"
+                # Tier 2 — source-control / env / db dumps. Require:
+                #   - non-HTML response (text or binary)
+                #   - body looks plausibly like the target file:
+                #       .git/HEAD / .git/config / .git/index → ref: or [core]
+                #       .env → KEY=value style line
+                #       dump / .sql → SQL keywords
+                # Otherwise demote to medium (still interesting, not high).
+                tier2_match = ("/.git" in p_low or "/.env" in p_low
+                                or "/dump" in p_low or "/.sql" in p_low)
+                if tier2_match:
+                    sample = body[:512]
+                    looks_real = False
+                    if "/.git" in p_low and (
+                            sample.startswith(b"ref: ")
+                            or b"[core]" in sample
+                            or b"DIRC" in sample[:4]):       # .git/index magic
+                        looks_real = True
+                    elif "/.env" in p_low and (
+                            re.search(rb"^[A-Z_][A-Z0-9_]{1,40}=", sample, re.M)
+                            is not None):
+                        looks_real = True
+                    elif ("/dump" in p_low or "/.sql" in p_low):
+                        sample_l = sample.lower()
+                        if (b"insert into" in sample_l
+                                or b"create table" in sample_l
+                                or b"-- mysqldump" in sample_l
+                                or b"-- postgresql" in sample_l):
+                            looks_real = True
+                    if looks_real and not is_html:
+                        sev = "high"
+                    elif not is_html:
+                        sev = "medium"
+                    else:
+                        # HTML response on a tier-2 path is almost certainly
+                        # a SPA route or friendly 404. Keep as low — don't
+                        # ship a high on a false trigger.
+                        sev = "low"
                 return DeepScanFinding(
                     url=full, probe=self.name,
                     signal="historical-url-still-live",
                     severity=sev,
                     title=f"Wayback-historical path {p} still serves content",
                     evidence=(r.text or "")[:300],
-                    extra={"status": r.status_code, "length": len(r.content),
+                    extra={"status": r.status_code, "length": len(body),
                            "historical-source": u,
-                           "content-type": r.headers.get("content-type","")},
+                           "content-type": ctype,
+                           "is-html": is_html},
                 )
             for f in await asyncio.gather(*(reprobe(p) for p in interesting)):
                 if f is not None:
@@ -1154,6 +1315,7 @@ class JsSecretMine(DeepScanProbe):
 
     SECRET_PATTERNS: tuple[tuple[str, str, str], ...] = (
         # (signal, severity, regex)
+        # High-confidence patterns — distinct prefix + entropy, low FP rate.
         ("aws-access-key",   "high",     r"AKIA[0-9A-Z]{16}"),
         ("aws-secret-key",   "high",     r'(?<![A-Za-z0-9])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9])'),  # very high FP; off by default
         ("github-pat",       "high",     r"ghp_[A-Za-z0-9]{36}"),
@@ -1161,12 +1323,34 @@ class JsSecretMine(DeepScanProbe):
         ("slack-token",      "high",     r"xox[bpoas]-[A-Za-z0-9-]{10,48}"),
         ("private-key",      "critical", r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----"),
         ("google-api-key",   "medium",   r"AIza[0-9A-Za-z\-_]{35}"),
-        ("jwt-token",        "medium",   r"eyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}"),
-        ("password-literal", "medium",   r'(?i)["\']?password["\']?\s*[:=]\s*["\'][^"\']{6,80}["\']'),
-        ("api-key-literal",  "medium",   r'(?i)["\']?api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{16,}["\']'),
+        # Low-confidence patterns — keyword-based, FP-prone. Demoted to info
+        # and filtered through _looks_like_placeholder() before emit. A real
+        # impact JWT / embedded credential is still surfaced; demo values,
+        # env-var templates, empty strings, and the jwt.io example payload
+        # are suppressed.
+        ("jwt-token",        "info",     r"eyJ[A-Za-z0-9\-_]{10,}\.eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}"),
+        ("password-literal", "info",     r'(?i)["\']?password["\']?\s*[:=]\s*["\'][^"\']{6,80}["\']'),
+        ("api-key-literal",  "info",     r'(?i)["\']?api[_-]?key["\']?\s*[:=]\s*["\'][A-Za-z0-9_\-]{16,}["\']'),
     )
     # aws-secret-key is too FP-prone — keep it off by default
     DISABLED = {"aws-secret-key"}
+    # Patterns to run through _looks_like_placeholder() before emit.
+    _NOISY_SIGNALS = frozenset({"jwt-token", "password-literal", "api-key-literal"})
+    # Substrings whose presence inside a quoted value strongly suggests it's
+    # a placeholder / template / docs example rather than a live secret.
+    _PLACEHOLDER_MARKERS = (
+        "your_", "your-", "<your", "<insert", "example", "sample", "demo",
+        "placeholder", "todo", "fixme", "changeme", "change_me", "change-me",
+        "redacted", "hunter2", "xxxxxx", "yyyyyy", "abcdef0123456789",
+        "password", "secret", "api_key", "apikey", "test-",
+    )
+
+    _QUOTED_VALUE_RE = re.compile(r'["\']([^"\']*)["\']\s*$')
+    # jwt.io demo JWT — verbatim string anyone copy-pastes from the homepage
+    _JWT_IO_DEMO_PREFIX = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9."
+        "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9l"
+    )
 
     SCRIPT_SRC_RE = re.compile(r'<script[^>]+src=["\']([^"\']+)["\']', re.I)
     # RFC1918 IPs + multi-segment internal hostnames. We *exclude* `.test`,
@@ -1229,12 +1413,61 @@ class JsSecretMine(DeepScanProbe):
             self._scan_body(j_url, body, findings, source_kind="js", from_page=page)
         return findings
 
+    @classmethod
+    def _looks_like_placeholder(cls, signal: str, match: str) -> bool:
+        """Return True if the regex match is almost certainly a placeholder
+        / template / docs example, not a live secret. Applied only to the
+        keyword-shaped patterns in _NOISY_SIGNALS — the high-entropy ones
+        (AWS/GitHub/Slack tokens, private keys) keep firing as-is.
+        """
+        if signal == "jwt-token":
+            if match.startswith(cls._JWT_IO_DEMO_PREFIX):
+                return True
+            parts = match.split(".")
+            if len(parts) == 3:
+                try:
+                    import base64
+                    padded = parts[1] + "=" * (-len(parts[1]) % 4)
+                    payload = (base64.urlsafe_b64decode(padded)
+                                     .decode("utf-8", errors="replace")
+                                     .lower())
+                    if any(t in payload for t in
+                           ('"sub":"1234567890"', "example.com",
+                            "john doe", "test-issuer", "localhost",
+                            '"iss":"example"', '"aud":"example"')):
+                        return True
+                except Exception:
+                    pass
+            return False
+        # password-literal / api-key-literal: extract the quoted value
+        # and apply placeholder heuristics.
+        v = cls._QUOTED_VALUE_RE.search(match)
+        if not v:
+            return False
+        val = v.group(1).strip()
+        if not val:
+            return True
+        # Env-var / template interpolation
+        if "${" in val or "{{" in val or "%{" in val or "<%" in val:
+            return True
+        # All-same-character mask (****, ------, xxxxxx)
+        if len(set(val)) == 1:
+            return True
+        val_low = val.lower()
+        for marker in cls._PLACEHOLDER_MARKERS:
+            if marker in val_low:
+                return True
+        return False
+
     def _scan_body(self, url: str, body: str, out: list, *,
                     source_kind: str, from_page: str | None = None) -> None:
         for signal, severity, pattern in self.SECRET_PATTERNS:
             if signal in self.DISABLED: continue
             for m in re.findall(pattern, body):
                 if isinstance(m, tuple): m = m[0]
+                if (signal in self._NOISY_SIGNALS
+                        and self._looks_like_placeholder(signal, m)):
+                    continue
                 out.append(DeepScanFinding(
                     url=url, probe=self.name,
                     signal=signal, severity=severity,
@@ -1259,7 +1492,12 @@ class JsSecretMine(DeepScanProbe):
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
                   WaybackHistorical, JsSecretMine,
-                  OriginCandidateProbe, OwaspVulnsProbe)
+                  # OriginCandidateProbe disabled — see TODO on the class.
+                  # Surfaced 37 FPs on a single PlanetHoster run because
+                  # the ASN heuristic flags any non-big-CDN ASN, including
+                  # the target's own hosting infra. Re-enable after the
+                  # rebuild described in the class docstring.
+                  OwaspVulnsProbe)
 
 
 class DeepScanner:
