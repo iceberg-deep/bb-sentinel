@@ -1,0 +1,59 @@
+{% from '_macros.j2' import section %}
+{% set vuln_class = finding.signal.split('-', 1)[1] if '-' in finding.signal else finding.signal %}
+{% set param = finding.extra.get('param') or finding.extra.get('parameter') or '?' %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title=({
+        "sqli":  "SQL injection on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "xss":   "Reflected XSS on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "lfi":   "Local file read on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "rfi":   "Remote file include on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "ssrf":  "Server-side request forgery on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "ssti":  "Template injection on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "rce":   "Command injection / RCE on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "xxe":   "XML external entity on " ~ finding.url ~ " parameter `" ~ (param|string) ~ "`",
+        "idor":  "IDOR on " ~ finding.url,
+    }.get(vuln_class, "OWASP-class vulnerability `" ~ vuln_class ~ "` on " ~ finding.url)),
+    impact=(
+({
+"sqli":  "SQL injection in a query parameter the application interpolates into a backend SQL query. Direct read "
+        "of any data the database role can see (PII, credentials, tokens). Depending on engine and driver, may "
+        "extend to filesystem read (`LOAD_FILE`), credential harvesting (`mysql.user`), or RCE on the DB host.",
+"xss":   "Reflected cross-site scripting: an attacker can craft a URL that, when visited by a logged-in user, "
+        "executes attacker JavaScript in the application's origin. Impact: session theft, account takeover (via "
+        "API token exfil), targeted phishing of the application's UI, CSRF amplification.",
+"lfi":   "Local file inclusion: a parameter is interpolated into a filesystem read. Attacker can read arbitrary "
+        "files the web user has access to (`/etc/passwd`, application config with DB credentials, AWS metadata "
+        "if hosted on EC2). Often chains to RCE via log poisoning or PHP wrapper abuse.",
+"rfi":   "Remote file inclusion: a parameter is interpolated into a URL fetch and the response is executed as "
+        "code. Direct path to RCE — attacker hosts a payload, points the application at it, gets code execution "
+        "on the server.",
+"ssrf":  "Server-side request forgery: a parameter is interpolated into a request the server makes on the "
+        "attacker's behalf. Impact: reach internal infrastructure (cloud metadata services, internal admin "
+        "panels, databases) that is normally firewalled off; chain into RCE on hosted cloud providers via the "
+        "metadata service (AWS IMDSv1, GCP metadata, etc.).",
+"ssti":  "Server-side template injection: user input is rendered by a template engine. Most engines (Jinja, "
+        "Twig, Velocity, Freemarker) allow code execution from template syntax — direct RCE.",
+"rce":   "Command injection: user input is interpolated into a shell command. Direct RCE on the server with the "
+        "privileges of the web user.",
+"xxe":   "XML external entity injection: the XML parser resolves external entities from attacker input. Impact: "
+        "file read on the server, SSRF, sometimes RCE depending on parser configuration.",
+"idor":  "Insecure direct object reference: the application uses a predictable identifier (sequential, GUID, or "
+        "user-supplied) to look up data without checking that the requesting user owns the referenced object. "
+        "Attacker can iterate identifiers to read / modify / delete other users' data.",
+}.get(vuln_class, "OWASP-class web vulnerability. Impact depends on what the parameter controls server-side."))
+),
+    validation=(
+"1. Confirm the finding manually with the curl command above. If the response shows the injected payload's "
+"   effect (echoed string, SQL error, file contents, internal request), the finding is real.\n"
+"2. **Do not** escalate the proof beyond what is needed to demonstrate. For SQLi: showing the database version "
+"   string is enough, do not dump tables. For SSRF: hitting `http://127.0.0.1/` or cloud metadata once is enough, "
+"   do not exfil credentials. For RCE: `id` or `whoami` is enough, do not run shells.\n"
+"3. Capture both the request and the response in the submission. Programs require both.\n"
+"4. Identify the user role required to trigger this (anonymous? authenticated? admin?). Anonymous-triggerable "
+"   issues are paid highest."
+),
+    note=(
+"This is the highest-payout finding class on every program. Keep the PoC minimal and reversible. **Do not** "
+"persist test data, do not modify production state, do not exfil real user data."
+)
+) }}

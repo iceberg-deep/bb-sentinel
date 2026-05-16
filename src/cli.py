@@ -483,6 +483,73 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
         click.echo(f"  ... +{len(filtered) - limit} more (see {out_path})")
 
 
+@cli.command()
+@click.option("--from-jsonl", "from_jsonl", type=click.Path(exists=True, dir_okay=False),
+              help="Read findings from a rocks JSONL output file")
+@click.option("--program", "program_name", default=None,
+              help="Pull program config (domains, auth, rate-limit) into the report header")
+@click.option("--out", "out_path", default=None,
+              help="Output markdown path (default: data/<program>-report.md)")
+@click.option("--pdf/--no-pdf", default=True, show_default=True,
+              help="Also render PDF alongside the markdown")
+@click.option("--min-severity-main", default="medium", show_default=True,
+              type=click.Choice(["critical", "high", "medium", "low", "info"]),
+              help="Findings below this go into Appendix A, not the main body")
+@click.pass_context
+def report(ctx: click.Context, from_jsonl: str | None, program_name: str | None,
+           out_path: str | None, pdf: bool, min_severity_main: str) -> None:
+    """Generate a professional Markdown + PDF report from scan findings."""
+    from .report import (ReportMetadata, render_markdown, render_pdf,
+                         load_findings_from_jsonl)
+
+    if not from_jsonl and not program_name:
+        raise click.UsageError("supply --from-jsonl FILE or --program NAME")
+
+    meta_kwargs: dict = {"program_name": program_name or "(unspecified)"}
+    auth_headers: dict[str, str] = {}
+    if program_name:
+        app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
+        cfg = app.programs.get(program_name)
+        if cfg is None:
+            raise click.ClickException(f"unknown program: {program_name}")
+        meta_kwargs.update(
+            domains=list(cfg.domains),
+            rate_limit_rps=getattr(cfg, "rate_limit_rps", None),
+            auth_used=bool(getattr(cfg, "auth_headers", None)),
+        )
+        auth_headers = dict(getattr(cfg, "auth_headers", {}) or {})
+        if not from_jsonl:
+            from_jsonl = f"data/{program_name}-rocks.jsonl"
+            if not Path(from_jsonl).exists():
+                raise click.ClickException(
+                    f"no --from-jsonl supplied and {from_jsonl} not found; "
+                    f"run `bb-sentinel rocks --program {program_name}` first")
+
+    findings = load_findings_from_jsonl(from_jsonl)
+    meta_kwargs["live_probes"] = len(findings)
+    meta_kwargs["tools_run"] = ["subfinder", "assetfinder", "crt.sh", "httpx", "rocks(10 probes)"]
+    from .report import ReportMetadata
+    meta = ReportMetadata(**meta_kwargs)
+
+    md = render_markdown(findings, meta, auth_headers=auth_headers,
+                          min_severity_in_main=min_severity_main)
+
+    if out_path is None:
+        out_path = f"data/{program_name or 'scan'}-report.md"
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_path).write_text(md, encoding="utf-8")
+    click.echo(f"wrote markdown: {out_path}")
+
+    if pdf:
+        pdf_path = str(Path(out_path).with_suffix(".pdf"))
+        result = render_pdf(md, pdf_path)
+        if result is None:
+            click.echo("PDF rendering skipped: weasyprint not installed. "
+                       "Install with: pip install weasyprint", err=True)
+        else:
+            click.echo(f"wrote pdf:      {result}")
+
+
 def main() -> None:
     cli(obj={})
 

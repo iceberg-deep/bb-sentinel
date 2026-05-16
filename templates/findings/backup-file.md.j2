@@ -1,0 +1,26 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="Backup / source file exposed at " ~ finding.url,
+    impact=(
+"A backup or pre-deployment artifact is being served by the web tier (`.bak`, `.old`, `.orig`, `.swp`, `~`, `.zip`, "
+"`.tar.gz`). Impact tiers: (a) **source-code disclosure** if the file is a server-side script saved as `.bak` — the "
+"web server stops interpreting it and returns plaintext source, revealing credentials, business logic, and "
+"vulnerabilities for follow-on exploitation; (b) **archive disclosure** if it's a `.zip`/`.tar` of the application — "
+"complete code + sometimes `.env` and database dumps; (c) **dev artifact disclosure** (`.swp`, editor temp files) "
+"revealing in-progress changes."
+),
+    validation=(
+"1. Confirm the file is the **actual artifact**, not an SPA shell returning 200 HTML. Check `Content-Type` and "
+"   the first bytes (`PK\\x03\\x04` for zip, `<?php` for backed-up PHP source, etc.).\n"
+"2. If the file is large (multi-MB archive), download a sample (`curl --range 0-65535`) before pulling the whole "
+"   thing — confirm the magic bytes match the claimed file type.\n"
+"3. Scan the contents for credentials (`grep -r -iE 'password|secret|api_key|aws_'`). Do not test any extracted "
+"   credentials.\n"
+"4. If the artifact contains source code, identify the most security-relevant files (auth, payments, admin) and "
+"   flag specific vulnerabilities found in the source as **additional separate reports**."
+),
+    note=(
+"Submission tactic: lead with the *most sensitive thing the backup contains*, not the backup file URL itself. "
+"\"DB credentials for production exposed in source backup\" pays multiples of \"backup file at /index.php.bak\"."
+)
+) }}

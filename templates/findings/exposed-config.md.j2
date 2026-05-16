@@ -1,0 +1,24 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="Exposed config/dotfile served by " ~ finding.url.split('/')[2] ~ " — potential credential disclosure",
+    impact=(
+"A config or dotfile that is normally restricted to deploy hosts is being served by the web tier. "
+"Depending on its contents this can leak: package-registry tokens (`.npmrc`), AWS / cloud credentials (`.env`), "
+"Git repository internals (`.git/config`, `HEAD`), or session/CSRF secrets. "
+"If the file contains live credentials, attacker-impact is **immediate** — puvendor-bh-or-clone access to the org's "
+"registries / repos / cloud accounts. Even an empty dotfile served by the application stack is a misconfigured "
+"webroot that often exposes other adjacent files."
+),
+    validation=(
+"1. **Confirm it is the real file**, not an SPA fallback. Many single-page apps return 200 with the "
+"HTML shell for unmatched paths. Check the `Content-Type` and the first bytes of the body.\n"
+"2. If the body is a config/dotfile, scan for actual secret material: `_authToken`, `aws_secret_access_key`, "
+"`DB_PASSWORD`, `SECRET_KEY`, etc.\n"
+"3. If secrets are present, **do not test them**. Report with the response excerpt only — using leaked creds "
+"is out of scope on every major program."
+),
+    note=(
+"False-positive risk on SPAs that return 200/HTML for arbitrary paths. The detection rule flags by URL pattern; "
+"the evidence excerpt above must be inspected to confirm the response is the actual config file before submitting."
+)
+) }}

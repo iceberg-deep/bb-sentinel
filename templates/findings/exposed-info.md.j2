@@ -1,0 +1,19 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    impact=(
+"Standard discovery artifact (`robots.txt`, `sitemap.xml`, `/.well-known/security.txt`). On its own this is "
+"**not a finding worth submitting** — every major program treats these as informational. Value is purely as "
+"a feeder: disallowed paths in robots, hidden URLs in sitemap, or a `security.txt` revealing a different "
+"reporting channel can lead to real findings on subsequent probes."
+),
+    validation=(
+"1. Read the file for non-obvious paths (admin/, internal/, /api/v2/legacy/).\n"
+"2. Probe each disclosed path manually for auth / IDOR / debug content.\n"
+"3. If `security.txt` reveals a different scope contact than the program brief, note the discrepancy but do **not** "
+"submit this URL as the finding."
+),
+    note=(
+"This belongs in Appendix A, not the main report body. Listed here only because it surfaced a path worth following — "
+"the actionable finding is whatever the disclosed path leads to, not this disclosure itself."
+)
+) }}
