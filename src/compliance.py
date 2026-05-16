@@ -214,8 +214,39 @@ def _scan_patterns(text: str, patterns: list[tuple[str, str]]) -> list[Complianc
     return out
 
 
+# Signals that actually block our automated pipeline. Every other prohibition
+# is either universal program-rule boilerplate (no-DoS, no-bruteforce) or
+# requires-approval gating (WARN-level, not block-level).
+HARD_BLOCK_SIGNALS = frozenset({
+    "explicit-no-automation",
+    "manual-testing-only",
+    "automated-prohibited",
+    "do-not-automated",
+    "automated-scanning-tools-mentioned",
+    "vuln-scanner-mention",
+    "specific-tool-named",
+    "no-fuzzing",
+    "no-scan",
+})
+# These are noted (printed in render()) but don't change verdict on their own
+# — every bounty program forbids DoS, that's universal not a tool-killer.
+WARN_LEVEL_SIGNALS = frozenset({
+    "no-dos",
+    "no-volumetric",
+    "no-bruteforce",
+    "requires-prior-approval",
+    "notify-before-scanning",
+})
+
+
 def assess_text(text: str, source: str = "<text>") -> ComplianceCheck:
-    """Apply the pattern tables to a rules-text blob and produce a verdict."""
+    """Apply the pattern tables to a rules-text blob and produce a verdict.
+
+    Signal classification:
+      HARD_BLOCK_SIGNALS  → BLOCK (or WARN if an explicit allowance contradicts)
+      WARN_LEVEL_SIGNALS  → WARN (rules to follow, but don't kill the pipeline)
+      Anything else       → just surfaced, doesn't change verdict
+    """
     text_lower = text.lower()
     prohibitions = _scan_patterns(text_lower, PROHIBITED_PATTERNS)
     allowances   = _scan_patterns(text_lower, PERMITTED_PATTERNS)
@@ -232,17 +263,16 @@ def assess_text(text: str, source: str = "<text>") -> ComplianceCheck:
         disclosure_status = "UNKNOWN"
     disclosure_matches = disc_forbid + disc_allow
 
-    # Verdict computation
-    has_block = any(p.signal != "requires-prior-approval" for p in prohibitions)
-    has_approval_req = any(p.signal == "requires-prior-approval" for p in prohibitions)
+    has_hard_block = any(p.signal in HARD_BLOCK_SIGNALS for p in prohibitions)
+    has_warn = any(p.signal in WARN_LEVEL_SIGNALS for p in prohibitions)
     has_allowance = bool(allowances)
 
-    if has_block and not has_allowance:
+    if has_hard_block and not has_allowance:
         verdict = "BLOCK"
-    elif has_block and has_allowance:
-        # contradiction — operator must read
+    elif has_hard_block and has_allowance:
+        # explicit allowance contradicts the prohibition — operator must read
         verdict = "WARN"
-    elif has_approval_req:
+    elif has_warn:
         verdict = "WARN"
     elif has_allowance:
         verdict = "OK"
