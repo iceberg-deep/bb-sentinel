@@ -381,8 +381,17 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
     else:
         raise click.UsageError("supply --from-jsonl FILE or --program NAME")
 
+    # Honor per-program rate limit if we loaded from DB (--program mode).
+    program_rate_limit = None
+    if program_name:
+        app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
+        cfg = app.programs.get(program_name)
+        if cfg and cfg.rate_limit_rps:
+            program_rate_limit = cfg.rate_limit_rps
+            click.echo(f"[rate-limit] honoring program cap: {program_rate_limit} RPS")
     click.echo(f"loaded {len(probes)} probe records → turning rocks")
-    scanner = DeepScanner(concurrency=concurrency, timeout=timeout)
+    scanner = DeepScanner(concurrency=concurrency, timeout=timeout,
+                          rate_limit_rps=program_rate_limit)
     findings = await scanner.scan(probes)
     click.echo(f"rocks produced {len(findings)} findings")
 

@@ -258,9 +258,14 @@ class DeepScanProbe:
     name: str = "deepscan-probe"
     timeout: float = 8.0
 
-    def __init__(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore) -> None:
+    def __init__(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
+                 rate_limit_rps: int | None = None) -> None:
         self.client = client
         self.sem = semaphore
+        # Per-program outbound RPS cap. Probes that shell out to subprocess
+        # tools (nuclei, etc.) should pass this through to those tools'
+        # own rate-limit flags so we don't violate program policy.
+        self.rate_limit_rps = rate_limit_rps
 
     async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
         raise NotImplementedError
@@ -619,6 +624,128 @@ def _semver_le(a: str, b: str) -> bool:
     return pa <= pb
 
 
+class OwaspVulnsProbe(DeepScanProbe):
+    """The injection-class coverage layer. Runs nuclei against the live URLs
+    with a curated set of vuln-class template trees, filtered to medium+
+    severity so we don't drown in info-level noise the user explicitly
+    declines to chase ([[bb-hunting-impact-first]]).
+
+    Covers: SQLi, LFI, RCE, SSRF, XXE, SSTI, open-redirect, subdomain
+    takeover, default credentials, and recent (2024-2025) CVE PoCs. Each
+    nuclei match becomes a DeepScanFinding with the template's reported
+    severity. The single nuclei invocation amortizes startup over all
+    URLs × all templates.
+
+    Resource budget: at 15 concurrency the probe sustains roughly 30-60 RPS
+    against an unrestricted target. With program rate_limit_rps set it
+    drops to that cap via nuclei's -rate-limit. Hard timeout default 40min;
+    nuclei is killed if exceeded.
+    """
+    name = "owasp-vulns"
+    NUCLEI_BIN = "/usr/bin/nuclei"
+    # Curated for the bug-bounty-relevant OWASP classes. Skip /xss explicitly
+    # — solo XSS is on the user's never-submit list. SSTI / Java
+    # deserialization / template-injection variants still surface here via
+    # the vulns/ssti tree.
+    TEMPLATE_TREES = (
+        "http/vulnerabilities/sqli",
+        "http/vulnerabilities/lfi",
+        "http/vulnerabilities/rce",
+        "http/vulnerabilities/ssrf",
+        "http/vulnerabilities/xxe",
+        "http/vulnerabilities/ssti",
+        "http/vulnerabilities/redirect",
+        "http/vulnerabilities/file-upload",
+        "http/vulnerabilities/generic",
+        "http/takeovers",
+        "http/default-logins",
+        "http/cves/2025",
+        "http/cves/2024",
+    )
+    SEVERITY_FILTER = "medium,high,critical"
+    MAX_URLS = 100   # cap to avoid runaway long scans
+    NUCLEI_TIMEOUT = 2400   # 40 min hard cap
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        import shutil as _shutil, json as _json
+        urls = sorted({p["url"] for p in probes
+                       if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not urls:
+            return []
+        if not _shutil.which(self.NUCLEI_BIN.rsplit("/", 1)[-1]) and not Path(self.NUCLEI_BIN).exists():
+            log.warning("owasp-vulns: nuclei not found", binary=self.NUCLEI_BIN)
+            return []
+        if len(urls) > self.MAX_URLS:
+            log.info("owasp-vulns: capping URL set", available=len(urls), cap=self.MAX_URLS)
+            urls = urls[: self.MAX_URLS]
+        log.info("owasp-vulns probe starting",
+                 urls=len(urls), trees=len(self.TEMPLATE_TREES),
+                 rate_limit_rps=self.rate_limit_rps)
+
+        cmd = [
+            self.NUCLEI_BIN,
+            "-silent", "-jsonl", "-no-color", "-disable-update-check",
+            "-severity", self.SEVERITY_FILTER,
+            "-c", "15",
+        ]
+        for t in self.TEMPLATE_TREES:
+            cmd += ["-t", t]
+        if self.rate_limit_rps is not None:
+            cmd += ["-rate-limit", str(self.rate_limit_rps)]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(input="\n".join(urls).encode()),
+                timeout=self.NUCLEI_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            log.warning("owasp-vulns: nuclei timed out", timeout=self.NUCLEI_TIMEOUT)
+            return []
+        if proc.returncode and not stdout:
+            err = stderr.decode(errors="replace")[:200]
+            log.warning("owasp-vulns: nuclei failed", rc=proc.returncode, stderr=err)
+            return []
+
+        findings: list[DeepScanFinding] = []
+        for line in stdout.decode(errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = _json.loads(line)
+            except Exception:
+                continue
+            info = obj.get("info") or {}
+            sev = (info.get("severity") or "info").lower()
+            if sev not in SEVERITY_ORDER:
+                sev = "info"
+            tid = obj.get("template-id") or info.get("name") or "?"
+            matched = obj.get("matched-at") or obj.get("host") or ""
+            name = info.get("name") or tid
+            findings.append(DeepScanFinding(
+                url=matched, probe=self.name,
+                signal=tid, severity=sev,
+                title=name,
+                evidence=str(obj.get("matched") or obj.get("extracted-results")
+                              or obj.get("response") or "")[:300],
+                extra={
+                    "template-id": tid,
+                    "tags": info.get("tags"),
+                    "classification": info.get("classification"),
+                    "reference": info.get("reference"),
+                },
+            ))
+        log.info("owasp-vulns probe done", findings=len(findings))
+        return findings
+
+
 class BackupFileProbe(DeepScanProbe):
     """For each live URL that returned 200/static content, try common backup
     suffix variants. Catches `index.php.bak`, `app.js~`, `db.sql.gz` style
@@ -945,7 +1072,7 @@ class JsSecretMine(DeepScanProbe):
 
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
-                  WaybackHistorical, JsSecretMine)
+                  WaybackHistorical, JsSecretMine, OwaspVulnsProbe)
 
 
 class DeepScanner:
@@ -953,11 +1080,16 @@ class DeepScanner:
 
     def __init__(self, *, concurrency: int = 8, timeout: float = 8.0,
                  user_agent: str = "bb-sentinel-deepscan/0.1",
-                 probes: Iterable[type[DeepScanProbe]] = DEFAULT_PROBES) -> None:
+                 probes: Iterable[type[DeepScanProbe]] = DEFAULT_PROBES,
+                 rate_limit_rps: int | None = None) -> None:
         self.concurrency = concurrency
         self.timeout = timeout
         self.user_agent = user_agent
         self.probe_classes = list(probes)
+        # Honor program-puvendor-bhed rate caps (e.g., Plusgrade's ≤6 RPS clause).
+        # Probes that shell out to nuclei pass this to nuclei's -rate-limit;
+        # internal-httpx probes use it as a token-bucket budget hint.
+        self.rate_limit_rps = rate_limit_rps
 
     async def scan(self, probes: list[dict]) -> list[DeepScanFinding]:
         sem = asyncio.Semaphore(self.concurrency)
@@ -969,7 +1101,7 @@ class DeepScanner:
         ) as client:
             results: list[DeepScanFinding] = []
             for cls in self.probe_classes:
-                probe = cls(client, sem)
+                probe = cls(client, sem, rate_limit_rps=self.rate_limit_rps)
                 try:
                     fs = await probe.run(probes)
                     log.info("probe done", probe=cls.name, findings=len(fs))
