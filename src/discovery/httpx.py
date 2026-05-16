@@ -27,9 +27,13 @@ class HttpxProbe(Discoverer):
     name = "httpx"
     binary = "httpx"
 
-    def __init__(self, binary_path: str | None = None, threads: int = 50, timeout: int = 600) -> None:
+    def __init__(self, binary_path: str | None = None, threads: int = 50,
+                 timeout: int = 600, rate_limit_rps: int | None = None) -> None:
         super().__init__(binary_path=binary_path, timeout=timeout)
         self.threads = threads
+        # Cap per-second outbound to honor a program's published rate limit.
+        # None = no explicit cap (still bounded by threads).
+        self.rate_limit_rps = rate_limit_rps
 
     async def probe(self, hostnames: list[str]) -> list[ProbeResult]:
         if not hostnames:
@@ -37,6 +41,13 @@ class HttpxProbe(Discoverer):
         if not self.is_available():
             log.warning("httpx binary not available", binary=self.binary_path)
             return []
+
+        # When a program-specific RPS cap is set, also reduce thread count to
+        # something proportionate — running 50 threads with -rl=5 just blocks
+        # 45 of them waiting for tokens.
+        effective_threads = self.threads
+        if self.rate_limit_rps is not None:
+            effective_threads = max(1, min(self.threads, self.rate_limit_rps * 2))
 
         cmd = [
             self.binary_path,
@@ -47,8 +58,10 @@ class HttpxProbe(Discoverer):
             "-tech-detect",
             "-no-color",
             "-threads",
-            str(self.threads),
+            str(effective_threads),
         ]
+        if self.rate_limit_rps is not None:
+            cmd += ["-rate-limit", str(self.rate_limit_rps)]
         rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(hostnames).encode())
         if rc != 0 and not stdout:
             log.error("httpx failed", rc=rc, stderr=stderr.decode(errors="replace")[:300])

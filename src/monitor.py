@@ -58,6 +58,22 @@ class ProgramScanner:
         program = await self._ensure_program_row(program_cfg)
         run = await self._start_run(program.id)
 
+        # If the program has a published rate limit, rebuild the active-probe
+        # wrappers for this scan with that cap applied. Avoids violating
+        # program rules like Plusgrade's "≤6 RPS" clause.
+        g = self.app.global_
+        if program_cfg.rate_limit_rps is not None:
+            log.info("rate-limit applied", program=program_cfg.name,
+                     rps=program_cfg.rate_limit_rps)
+            self.httpx = HttpxProbe(
+                binary_path=g.tool("httpx"), threads=g.httpx_threads,
+                rate_limit_rps=program_cfg.rate_limit_rps,
+            )
+            self.nuclei = NucleiTech(
+                binary_path=g.tool("nuclei"), concurrency=g.nuclei_concurrency,
+                rate_limit_rps=program_cfg.rate_limit_rps,
+            )
+
         try:
             scope = InscopeFilter(
                 binary_path=self.app.global_.tool("inscope"),

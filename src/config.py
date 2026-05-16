@@ -42,6 +42,12 @@ class ProgramConfig(BaseModel):
     rules_text: str | None = None
     # Manual override after the operator has reviewed the program rules.
     compliance_override: bool = False
+    # Program-specific outbound rate limit. When set, overrides the global
+    # httpx_threads / nuclei_concurrency for this program's scans and gets
+    # passed as `-rate-limit N` to the subprocess tools so we don't exceed
+    # the program's stated cap. Example: Plusgrade Loyalty's brief says
+    # "throttle traffic to six requests per second or less".
+    rate_limit_rps: int | None = None
 
     @field_validator("domains")
     @classmethod
