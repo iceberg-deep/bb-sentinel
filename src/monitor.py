@@ -41,10 +41,15 @@ class ScanStats:
 class ProgramScanner:
     """Runs one end-to-end scan for a single program."""
 
-    def __init__(self, app: AppConfig, db: Database, sender: WebhookSender | None = None) -> None:
+    def __init__(self, app: AppConfig, db: Database, sender: WebhookSender | None = None,
+                 progress=None) -> None:
         self.app = app
         self.db = db
         self.sender = sender or WebhookSender(timeout=app.global_.webhook_timeout)
+        # Optional human-readable progress reporter (see src/progress.py).
+        # When None, the scanner stays silent on stdout/stderr — same
+        # behavior as before this flag existed.
+        self.progress = progress
         g = app.global_
         self.subfinder = Subfinder(binary_path=g.tool("subfinder"))
         self.assetfinder = Assetfinder(binary_path=g.tool("assetfinder"))
@@ -81,6 +86,7 @@ class ProgramScanner:
                 auth_headers=program_cfg.auth_headers,
             )
 
+        prog = self.progress
         try:
             scope = InscopeFilter(
                 binary_path=self.app.global_.tool("inscope"),
@@ -88,13 +94,33 @@ class ProgramScanner:
             )
 
             # 1) Subdomain discovery (run sources in parallel)
-            disc = await self._gather_subdomains(program_cfg.domains)
-            stats.errors.extend(disc.errors)
-            unique_hosts = sorted({h.hostname for h in disc.hosts if h.hostname})
-            stats.discovered_hosts = len(unique_hosts)
+            if prog:
+                with prog.phase(f"[{program_cfg.name}] discovery"):
+                    prog.step("subfinder", "enumerating subdomains…")
+                    prog.step("assetfinder", "querying passive sources…")
+                    prog.step("crt.sh", "mining CT logs…")
+                    disc = await self._gather_subdomains(program_cfg.domains)
+                    stats.errors.extend(disc.errors)
+                    unique_hosts = sorted({h.hostname for h in disc.hosts if h.hostname})
+                    stats.discovered_hosts = len(unique_hosts)
+                    prog.info(f"  → {len(unique_hosts)} unique hostnames discovered")
+                    if disc.errors:
+                        prog.warn(f"{len(disc.errors)} discovery error(s) (non-fatal)")
+            else:
+                disc = await self._gather_subdomains(program_cfg.domains)
+                stats.errors.extend(disc.errors)
+                unique_hosts = sorted({h.hostname for h in disc.hosts if h.hostname})
+                stats.discovered_hosts = len(unique_hosts)
 
             # 2) Scope filter
-            kept, _ = await scope.filter(unique_hosts)
+            if prog:
+                with prog.phase(f"[{program_cfg.name}] scope filter"):
+                    kept, _ = await scope.filter(unique_hosts)
+                    dropped = len(unique_hosts) - len(kept)
+                    prog.info(f"  → kept {len(kept)} / {len(unique_hosts)} hosts "
+                              f"({dropped} dropped as out-of-scope)")
+            else:
+                kept, _ = await scope.filter(unique_hosts)
 
             # 3) Persist hostnames — get the new ones
             new_assets = await self.db.add_assets(program.id, kept, source="discovery")
@@ -102,7 +128,18 @@ class ProgramScanner:
 
             # 4) Probe with httpx — limit to new hosts + a refresh of known live hosts
             to_probe = sorted({a.hostname for a in new_assets} | await self._refresh_targets(program.id))
-            probes = await self.httpx.probe(to_probe) if to_probe else []
+            if prog:
+                with prog.phase(f"[{program_cfg.name}] active probing"):
+                    if to_probe:
+                        rps_note = f" at {program_cfg.rate_limit_rps} RPS" if program_cfg.rate_limit_rps else ""
+                        prog.step("httpx", f"probing {len(to_probe)} hosts{rps_note}…")
+                        probes = await self.httpx.probe(to_probe)
+                        prog.step("httpx", f"{len(probes)} live", ok=True)
+                    else:
+                        probes = []
+                        prog.info("  no hosts to probe (everything already baseline)")
+            else:
+                probes = await self.httpx.probe(to_probe) if to_probe else []
             stats.live_probes = len(probes)
 
             # 5) Optional nuclei tech enrichment for new/interesting probes.
@@ -114,12 +151,23 @@ class ProgramScanner:
             urls_to_enrich = [p.url for p in probes if p.host in new_host_set and p.url]
             tech_map = {}
             if urls_to_enrich:
-                try:
-                    tech_map = await self.nuclei.detect(urls_to_enrich)
-                except Exception as e:
-                    log.warning("nuclei tech-detect failed — continuing without enrichment",
-                                error=str(e)[:200])
-                    stats.errors.append(f"nuclei enrichment failed: {str(e)[:200]}")
+                if prog:
+                    with prog.phase(f"[{program_cfg.name}] tech enrichment"):
+                        prog.step("nuclei", f"detecting tech across {len(urls_to_enrich)} URLs…")
+                        try:
+                            tech_map = await self.nuclei.detect(urls_to_enrich)
+                            hits = sum(1 for v in tech_map.values() if v.technologies)
+                            prog.step("nuclei", f"{hits} URLs matched tech templates", ok=True)
+                        except Exception as e:
+                            prog.warn(f"nuclei timed out / failed — continuing: {str(e)[:120]}")
+                            stats.errors.append(f"nuclei enrichment failed: {str(e)[:200]}")
+                else:
+                    try:
+                        tech_map = await self.nuclei.detect(urls_to_enrich)
+                    except Exception as e:
+                        log.warning("nuclei tech-detect failed — continuing without enrichment",
+                                    error=str(e)[:200])
+                        stats.errors.append(f"nuclei enrichment failed: {str(e)[:200]}")
 
             # 6) Persist findings + score + collect alerts
             alerts = await self._record_findings(program.id, probes, tech_map, scope_kept=set(kept))
