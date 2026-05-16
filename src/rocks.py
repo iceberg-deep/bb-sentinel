@@ -56,40 +56,159 @@ class DeepScanFinding:
 # 2xx AND the body must not look like a generic 404 page.
 HIGH_VALUE_PATHS: list[tuple[str, str, str]] = [
     # (path, signal-token, severity-if-real-200)
+    # Source-control exposure
     ("/.git/HEAD",                    "exposed-git",            "high"),
     ("/.git/config",                  "exposed-git",            "high"),
+    ("/.git/index",                   "exposed-git",            "high"),
+    ("/.gitignore",                   "exposed-gitignore",      "info"),
+    ("/.svn/entries",                 "exposed-svn",            "medium"),
+    ("/.svn/wc.db",                   "exposed-svn",            "medium"),
+    ("/.hg/store/00manifest.i",       "exposed-hg",             "medium"),
+    ("/.bzr/branch/branch-format",    "exposed-bzr",            "medium"),
+    # Env / config files
     ("/.env",                         "exposed-env",            "high"),
     ("/.env.local",                   "exposed-env",            "high"),
     ("/.env.production",              "exposed-env",            "high"),
-    ("/.svn/entries",                 "exposed-svn",            "medium"),
+    ("/.env.development",             "exposed-env",            "high"),
+    ("/.env.dev",                     "exposed-env",            "high"),
+    ("/.env.staging",                 "exposed-env",            "high"),
+    ("/.env.backup",                  "exposed-env",            "high"),
+    ("/config.json",                  "exposed-config-json",    "medium"),
+    ("/config.yaml",                  "exposed-config-yaml",    "medium"),
+    ("/settings.py",                  "exposed-django-settings","high"),
+    ("/wp-config.php.bak",            "exposed-wp-config",      "critical"),
+    ("/application.properties",       "exposed-spring-props",   "high"),
+    ("/application.yml",              "exposed-spring-props",   "high"),
+    # OS-level junk
     ("/.DS_Store",                    "exposed-dsstore",        "low"),
+    ("/Thumbs.db",                    "exposed-thumbs",         "info"),
+    ("/.htaccess",                    "exposed-htaccess",       "low"),
+    ("/.htpasswd",                    "exposed-htpasswd",       "high"),
+    # Source / db dump suffixes (no-path versions — file-suffix probe adds the
+    # rest dynamically against discovered URLs)
     ("/backup.zip",                   "exposed-backup",         "high"),
+    ("/backup.tar.gz",                "exposed-backup",         "high"),
+    ("/backup.sql",                   "exposed-db-dump",        "high"),
     ("/db.sql",                       "exposed-db-dump",        "high"),
-    ("/composer.lock",                "exposed-composer-lock",  "low"),
-    ("/package-lock.json",            "exposed-npm-lock",       "info"),
-    ("/web.config",                   "exposed-webconfig",      "medium"),
+    ("/database.sql",                 "exposed-db-dump",        "high"),
+    ("/dump.sql",                     "exposed-db-dump",        "high"),
+    ("/site.zip",                     "exposed-backup",         "high"),
+    ("/www.zip",                      "exposed-backup",         "high"),
+    # Java app servers
     ("/WEB-INF/web.xml",              "exposed-webxml",         "high"),
+    ("/META-INF/MANIFEST.MF",         "exposed-manifest",       "low"),
+    ("/web.config",                   "exposed-webconfig",      "medium"),
+    # Apache / Nginx / server status
     ("/server-status",                "exposed-apache-status",  "medium"),
-    ("/swagger-ui.html",              "exposed-swagger-ui",     "low"),
+    ("/server-info",                  "exposed-apache-info",    "medium"),
+    ("/nginx-status",                 "exposed-nginx-status",   "medium"),
+    ("/status",                       "exposed-status",         "low"),
+    # API docs / Swagger / OpenAPI / GraphQL (15+ variants)
+    ("/swagger",                      "exposed-swagger",        "low"),
+    ("/swagger/",                     "exposed-swagger",        "low"),
     ("/swagger.json",                 "exposed-swagger-json",   "low"),
+    ("/swagger-ui",                   "exposed-swagger-ui",     "low"),
+    ("/swagger-ui/",                  "exposed-swagger-ui",     "low"),
+    ("/swagger-ui.html",              "exposed-swagger-ui",     "low"),
+    ("/swagger-ui/index.html",        "exposed-swagger-ui",     "low"),
+    ("/api-docs",                     "exposed-api-docs",       "low"),
+    ("/api/docs",                     "exposed-api-docs",       "low"),
+    ("/api/swagger",                  "exposed-swagger",        "low"),
+    ("/api/swagger.json",             "exposed-swagger-json",   "low"),
+    ("/api/v1/swagger.json",          "exposed-swagger-json",   "low"),
     ("/v2/api-docs",                  "exposed-swagger-json",   "low"),
     ("/v3/api-docs",                  "exposed-openapi-json",   "low"),
     ("/openapi.json",                 "exposed-openapi-json",   "low"),
+    ("/openapi.yaml",                 "exposed-openapi-yaml",   "low"),
+    ("/redoc",                        "exposed-redoc",          "low"),
     ("/graphql",                      "exposed-graphql",        "low"),
+    ("/graphiql",                     "exposed-graphiql",       "low"),
+    ("/api/graphql",                  "exposed-graphql",        "low"),
+    ("/__graphql",                    "exposed-graphql",        "low"),
+    # Spring Boot Actuator (deeply expanded)
     ("/actuator",                     "exposed-actuator",       "medium"),
+    ("/actuator/",                    "exposed-actuator",       "medium"),
     ("/actuator/env",                 "exposed-actuator-env",   "high"),
     ("/actuator/heapdump",            "exposed-actuator-heap",  "critical"),
     ("/actuator/mappings",            "exposed-actuator-map",   "medium"),
     ("/actuator/beans",               "exposed-actuator-beans", "medium"),
+    ("/actuator/health",              "exposed-actuator-health","info"),
+    ("/actuator/info",                "exposed-actuator-info",  "info"),
+    ("/actuator/trace",               "exposed-actuator-trace", "high"),
+    ("/actuator/httptrace",           "exposed-actuator-trace", "high"),
+    ("/actuator/configprops",         "exposed-actuator-config","medium"),
+    ("/actuator/loggers",             "exposed-actuator-loggers","low"),
+    ("/actuator/threaddump",          "exposed-actuator-thread","medium"),
+    ("/actuator/metrics",             "exposed-actuator-metrics","low"),
+    ("/manage/actuator",              "exposed-actuator",       "medium"),
+    ("/management/actuator",          "exposed-actuator",       "medium"),
+    # DB consoles
     ("/h2-console",                   "exposed-h2-console",     "high"),
+    ("/h2-console/login.jsp",         "exposed-h2-console",     "high"),
     ("/phpmyadmin/",                  "exposed-phpmyadmin",     "medium"),
+    ("/myadmin/",                     "exposed-phpmyadmin",     "medium"),
+    ("/adminer.php",                  "exposed-adminer",        "medium"),
+    ("/pma/",                         "exposed-phpmyadmin",     "medium"),
+    # Admin / dashboards (broad)
+    ("/admin",                        "exposed-admin",          "low"),
+    ("/admin/",                       "exposed-admin",          "low"),
+    ("/administrator/",               "exposed-administrator",  "low"),
+    ("/admin.php",                    "exposed-admin",          "low"),
+    ("/dashboard",                    "exposed-dashboard",      "low"),
+    ("/console",                      "exposed-console",        "low"),
+    ("/manage",                       "exposed-manage",         "low"),
+    ("/management",                   "exposed-management",     "low"),
+    # CMS
     ("/wp-admin/",                    "exposed-wp-admin",       "low"),
-    ("/.well-known/security.txt",     "well-known-security",    "info"),
+    ("/wp-login.php",                 "exposed-wp-login",       "low"),
+    ("/wp-content/uploads/",          "exposed-wp-uploads",     "low"),
+    ("/wp-config.php.bak",            "exposed-wp-config-bak",  "critical"),
+    ("/wp-json/wp/v2/users",          "exposed-wp-users",       "medium"),
+    ("/joomla/administrator/",        "exposed-joomla-admin",   "low"),
+    ("/user/login",                   "exposed-drupal-login",   "info"),
+    # Java tooling
+    ("/jenkins/",                     "exposed-jenkins",        "medium"),
+    ("/jenkins/script",               "exposed-jenkins-script", "critical"),
+    ("/gitlab/",                      "exposed-gitlab",         "low"),
+    ("/nexus/",                       "exposed-nexus",          "low"),
+    ("/artifactory/",                 "exposed-artifactory",    "low"),
+    # Tomcat-specific
     ("/examples/",                    "tomcat-examples",        "low"),
     ("/examples/jsp/snp/snoop.jsp",   "tomcat-snoop",           "low"),
     ("/docs/",                        "tomcat-docs",            "low"),
-    ("/manager/html",                 "tomcat-manager",         "medium"),  # only if no auth
+    ("/manager/html",                 "tomcat-manager",         "medium"),
+    ("/manager/status",               "tomcat-manager-status",  "low"),
+    ("/host-manager/html",            "tomcat-host-manager",    "medium"),
+    # Well-known
+    ("/.well-known/security.txt",     "well-known-security",    "info"),
+    ("/.well-known/openid-configuration", "well-known-oidc",    "info"),
+    ("/.well-known/oauth-authorization-server", "well-known-oauth-as", "info"),
+    # Cloud metadata / IaC artifacts
+    ("/.aws/credentials",             "exposed-aws-creds",      "critical"),
+    ("/.aws/config",                  "exposed-aws-config",     "high"),
+    ("/cloud-config.yml",             "exposed-cloud-config",   "high"),
+    ("/docker-compose.yml",           "exposed-docker-compose", "medium"),
+    ("/Dockerfile",                   "exposed-dockerfile",     "low"),
+    ("/.npmrc",                       "exposed-npmrc",          "high"),
+    ("/.pypirc",                      "exposed-pypirc",         "high"),
+    # Robots / sitemap (low-impact but used as crawl seeds)
+    ("/robots.txt",                   "exposed-robots",         "info"),
+    ("/sitemap.xml",                  "exposed-sitemap",        "info"),
+    # Misc info-disclosure
+    ("/phpinfo.php",                  "exposed-phpinfo",        "high"),
+    ("/info.php",                     "exposed-phpinfo",        "high"),
+    ("/test.php",                     "exposed-test-php",       "low"),
+    ("/crossdomain.xml",              "exposed-crossdomain",    "info"),
+    ("/clientaccesspolicy.xml",       "exposed-silverlight",    "info"),
 ]
+
+
+# Common backup/source extensions to try against *discovered* URLs (the
+# BackupFileProbe appends these to any 200-static-resource URL it sees).
+BACKUP_SUFFIXES: tuple[str, ...] = (
+    ".bak", ".old", ".orig", ".swp", ".tmp", ".backup", ".save", ".copy",
+    "~", ".1", ".gz", ".zip",
+)
 
 BYPASS_HEADERS: list[tuple[str, str | None]] = [
     ("X-Forwarded-For", "127.0.0.1"),
@@ -500,6 +619,126 @@ def _semver_le(a: str, b: str) -> bool:
     return pa <= pb
 
 
+class BackupFileProbe(DeepScanProbe):
+    """For each live URL that returned 200/static content, try common backup
+    suffix variants. Catches `index.php.bak`, `app.js~`, `db.sql.gz` style
+    accidents where the original file was puvendor-bhed next to a saved-by-editor
+    copy. Cheap (a handful of GETs per 200) and high-leverage when there's a
+    leak."""
+    name = "backup-file"
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        # Targets: live 200 URLs that look like a specific resource (have
+        # a path beyond `/`). Bare-root URLs don't make sense to backup-probe.
+        from urllib.parse import urlparse
+        candidates: list[str] = []
+        for p in probes:
+            if not p.get("status_code") or not (200 <= p["status_code"] < 400):
+                continue
+            url = p.get("url", "")
+            path = urlparse(url).path
+            if path in ("", "/"): continue
+            candidates.append(url)
+        if not candidates:
+            return []
+        log.info("backup-file probe", urls=len(candidates),
+                 suffixes=len(BACKUP_SUFFIXES))
+
+        async def check(url: str, suffix: str):
+            target = url + suffix
+            r = await self._get(target)
+            if r is None or r.status_code not in (200, 206):
+                return None
+            body = r.content
+            if len(body) < 16: return None
+            ctype = r.headers.get("content-type", "")
+            # Skip if response is text/html (likely 200-fallback for missing file)
+            if ctype.startswith("text/html"):
+                return None
+            return DeepScanFinding(
+                url=target, probe=self.name,
+                signal=f"exposed-backup{suffix}",
+                severity="high",
+                title=f"Backup-suffix variant returned {r.status_code} ({len(body)} bytes)",
+                evidence=body[:300].decode("utf-8", errors="replace"),
+                extra={"content-type": ctype, "length": len(body),
+                       "suffix": suffix, "original-url": url},
+            )
+
+        findings: list[DeepScanFinding] = []
+        tasks = [check(u, s) for u in candidates[:120] for s in BACKUP_SUFFIXES]
+        for f in await asyncio.gather(*tasks):
+            if f is not None: findings.append(f)
+        return findings
+
+
+class MethodEnumProbe(DeepScanProbe):
+    """Enumerate uncommon HTTP methods against each live URL. Surfaces:
+      - PUT / DELETE returning 200/201/204 = unauth write (critical)
+      - TRACE returning 200 = XST (low/info)
+      - PROPFIND returning 207 = WebDAV exposed (medium-high)
+      - Custom methods returning non-error = misconfigured proxy
+    Sends one request per (URL, method); ~8 extra requests per host."""
+    name = "method-enum"
+    METHODS = ("OPTIONS", "PUT", "DELETE", "PATCH", "TRACE", "PROPFIND", "CONNECT", "DEBUG")
+    # Methods we care about IF they return success. OPTIONS is informational
+    # (always 200 + Allow header) — surface only the Allow contents.
+    INTERESTING_STATUS = {"PUT": (200, 201, 204),
+                          "DELETE": (200, 204),
+                          "PATCH": (200, 201, 204),
+                          "TRACE": (200,),
+                          "PROPFIND": (207, 200),
+                          "DEBUG": (200,),
+                          "CONNECT": (200, 405)}  # 405 = method known, could still be probed
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        log.info("method-enum probe", urls=len(bases), methods=len(self.METHODS))
+        findings: list[DeepScanFinding] = []
+
+        async def try_method(url: str, method: str):
+            async with self.sem:
+                try:
+                    r = await self.client.request(method, url, timeout=self.timeout)
+                except Exception:
+                    return None
+            # OPTIONS: surface Allow header content only if it includes write methods
+            if method == "OPTIONS":
+                allow = (r.headers.get("allow") or r.headers.get("Allow") or "").upper()
+                write_methods = [m for m in ("PUT", "DELETE", "PATCH", "MKCOL")
+                                 if m in allow]
+                if not write_methods: return None
+                return DeepScanFinding(
+                    url=url, probe=self.name,
+                    signal="options-allow-writes",
+                    severity="low",
+                    title=f"OPTIONS response advertises write methods: {','.join(write_methods)}",
+                    evidence=f"Allow: {allow}",
+                    extra={"allow": allow, "write-methods": write_methods},
+                )
+            # Other methods: flag if status matches the interesting set
+            interesting = self.INTERESTING_STATUS.get(method, ())
+            if r.status_code not in interesting:
+                return None
+            sev = "high" if method in ("PUT", "DELETE", "PATCH") else "medium"
+            if method == "TRACE": sev = "low"
+            return DeepScanFinding(
+                url=url, probe=self.name,
+                signal=f"method-{method.lower()}-accepted",
+                severity=sev,
+                title=f"{method} returned {r.status_code}",
+                evidence=(r.text or "")[:300],
+                extra={"method": method, "status": r.status_code,
+                       "length": len(r.content)},
+            )
+
+        tasks = [try_method(u, m) for u in bases for m in self.METHODS]
+        for f in await asyncio.gather(*tasks):
+            if f is not None: findings.append(f)
+        return findings
+
+
 class WaybackHistorical(DeepScanProbe):
     """Pull historical URLs from web.archive.org's CDX index for each base's
     host, then re-probe a bounded sample against the live host. Anything that
@@ -704,7 +943,8 @@ class JsSecretMine(DeepScanProbe):
 
 # -- Orchestrator -----------------------------------------------------------
 
-DEFAULT_PROBES = (PathSweep, Bypass403, CorsProbe, TomcatFingerprint,
+DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
+                  Bypass403, CorsProbe, TomcatFingerprint,
                   WaybackHistorical, JsSecretMine)
 
 
@@ -742,8 +982,9 @@ class DeepScanner:
 
 __all__ = [
     "DeepScanFinding", "DeepScanner", "DeepScanProbe",
-    "PathSweep", "Bypass403", "CorsProbe", "TomcatFingerprint",
+    "PathSweep", "BackupFileProbe", "MethodEnumProbe",
+    "Bypass403", "CorsProbe", "TomcatFingerprint",
     "WaybackHistorical", "JsSecretMine",
-    "HIGH_VALUE_PATHS", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
+    "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
     "SEVERITY_ORDER", "SEVERITY_WEIGHT",
 ]
