@@ -1251,7 +1251,8 @@ class DeepScanner:
                  probes: Iterable[type[DeepScanProbe]] = DEFAULT_PROBES,
                  rate_limit_rps: int | None = None,
                  auth_headers: dict[str, str] | None = None,
-                 in_scope_hosts: Iterable[str] | None = None) -> None:
+                 in_scope_hosts: Iterable[str] | None = None,
+                 progress=None) -> None:
         self.concurrency = concurrency
         self.timeout = timeout
         self.user_agent = user_agent
@@ -1265,8 +1266,11 @@ class DeepScanner:
         # CDNs); subprocess tools (nuclei) send globally.
         self.auth_headers = auth_headers or {}
         self.in_scope_hosts = frozenset((h or "").lower() for h in (in_scope_hosts or []))
+        # Optional human-readable progress reporter (see src/progress.py).
+        self.progress = progress
 
     async def scan(self, probes: list[dict]) -> list[DeepScanFinding]:
+        import time
         sem = asyncio.Semaphore(self.concurrency)
         async with httpx.AsyncClient(
             verify=False,
@@ -1282,12 +1286,33 @@ class DeepScanner:
                     auth_headers=self.auth_headers,
                     in_scope_hosts=self.in_scope_hosts,
                 )
+                t_start = time.monotonic()
+                if self.progress:
+                    self.progress.step(cls.name, "running…")
                 try:
                     fs = await probe.run(probes)
                     log.info("probe done", probe=cls.name, findings=len(fs))
                     results.extend(fs)
-                except Exception:
+                    if self.progress:
+                        dur = time.monotonic() - t_start
+                        sev_counts = {}
+                        for f in fs:
+                            sev_counts[f.severity] = sev_counts.get(f.severity, 0) + 1
+                        sev_summary = ", ".join(
+                            f"{n} {s}" for s, n in sorted(
+                                sev_counts.items(),
+                                key=lambda kv: SEVERITY_ORDER.index(kv[0]))
+                        ) or "no findings"
+                        self.progress.step(
+                            cls.name,
+                            f"{sev_summary}  ({self.progress._fmt_duration(dur)})",
+                            ok=True,
+                        )
+                except Exception as e:
                     log.exception("probe failed", probe=cls.name)
+                    if self.progress:
+                        self.progress.step(cls.name, f"failed: {type(e).__name__}: {str(e)[:80]}",
+                                            ok=False)
             results.sort(key=lambda f: SEVERITY_ORDER.index(f.severity))
             return results
 

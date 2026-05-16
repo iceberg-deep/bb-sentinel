@@ -63,13 +63,36 @@ def _coro(fn):
 @click.option("--programs", "programs_path", default=lambda: os.environ.get("BB_PROGRAMS_CONFIG", "config/programs.yaml"), show_default=True)
 @click.option("--global", "global_path", default=lambda: os.environ.get("BB_GLOBAL_CONFIG", "config/global.yaml"), show_default=True)
 @click.option("--log-level", default="INFO")
+@click.option("-v", "verbose", count=True,
+              help="Increase verbosity: -v adds per-step detail, -vv adds raw structlog/JSON")
+@click.option("-q", "--quiet", is_flag=True, help="Errors and final summary only")
 @click.pass_context
-def cli(ctx: click.Context, programs_path: str, global_path: str, log_level: str) -> None:
+def cli(ctx: click.Context, programs_path: str, global_path: str, log_level: str,
+        verbose: int, quiet: bool) -> None:
     """bb-sentinel — bug bounty asset monitoring."""
-    _configure_cli_logging(log_level)
+    # Verbosity → progress level mapping (used by the human-readable
+    # `Progress` reporter) and underlying log level (structlog).
+    if quiet:
+        progress_level = "quiet"
+        effective_log = "ERROR"
+    elif verbose >= 2:
+        progress_level = "debug"
+        effective_log = "DEBUG"
+    elif verbose == 1:
+        progress_level = "verbose"
+        effective_log = log_level
+    else:
+        progress_level = "normal"
+        # Suppress structlog INFO chatter in normal mode; the human Progress
+        # reporter narrates the same phases more cleanly. Keep WARN/ERROR.
+        effective_log = "WARNING"
+    _configure_cli_logging(effective_log)
     ctx.ensure_object(dict)
     ctx.obj["programs_path"] = programs_path
     ctx.obj["global_path"] = global_path
+    ctx.obj["progress_level"] = progress_level
+    from .progress import make_progress
+    ctx.obj["progress"] = make_progress(progress_level)
 
 
 @cli.group()
@@ -179,17 +202,35 @@ async def _preflight_compliance(cfg, ignore: bool, assume_yes: bool) -> None:
 async def scan(ctx: click.Context, program_name: str, force: bool,
                ignore_compliance: bool, yes: bool) -> None:
     """Run a one-off scan for a single program."""
+    progress = ctx.obj.get("progress")
     app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
     cfg = app.programs.get(program_name)
     if not cfg:
         raise click.ClickException(f"unknown program: {program_name}")
+    if progress:
+        progress.info(f"[{program_name}] starting scan")
+        progress.detail(f"roots: {','.join(cfg.domains)}")
+        if cfg.rate_limit_rps:
+            progress.detail(f"rate limit: {cfg.rate_limit_rps} RPS")
+        if cfg.auth_headers:
+            progress.detail(f"auth headers: {sorted(cfg.auth_headers.keys())}")
     await _preflight_compliance(cfg, ignore_compliance, yes)
     db = Database(app.global_.database_url)
     await db.create_all()
     try:
-        scanner = ProgramScanner(app, db)
+        scanner = ProgramScanner(app, db, progress=progress)
         stats = await scanner.scan(cfg, force=force)
-        click.echo(json.dumps(stats.to_dict(), indent=2))
+        if progress:
+            progress.summary(lines=[
+                f"  discovered_hosts: {stats.discovered_hosts}",
+                f"  new_hosts:        {stats.new_hosts}",
+                f"  live_probes:      {stats.live_probes}",
+                f"  new_findings:     {stats.new_findings}",
+                f"  alerts_sent:      {stats.alerts_sent}",
+                *([f"  errors:           {len(stats.errors)}"] if stats.errors else []),
+            ])
+        else:
+            click.echo(json.dumps(stats.to_dict(), indent=2))
     finally:
         await db.dispose()
 
@@ -398,14 +439,25 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
             # Use domain roots as the scope-restriction list. Python rocks
             # probes only send auth headers to hosts ending in one of these.
             program_in_scope = list(cfg.domains)
-    click.echo(f"loaded {len(probes)} probe records → turning rocks")
+    progress = ctx.obj.get("progress")
+    if progress:
+        progress.info(f"[rocks] {len(probes)} probe records loaded")
+    else:
+        click.echo(f"loaded {len(probes)} probe records → turning rocks")
+
     scanner = DeepScanner(
         concurrency=concurrency, timeout=timeout,
         rate_limit_rps=program_rate_limit,
         auth_headers=program_auth, in_scope_hosts=program_in_scope,
+        progress=progress,
     )
-    findings = await scanner.scan(probes)
-    click.echo(f"rocks produced {len(findings)} findings")
+    if progress:
+        with progress.phase("rocks (10 probes)"):
+            findings = await scanner.scan(probes)
+    else:
+        findings = await scanner.scan(probes)
+    if not progress:
+        click.echo(f"rocks produced {len(findings)} findings")
 
     min_idx = SEVERITY_ORDER.index(min_severity)
     filtered = [f for f in findings if SEVERITY_ORDER.index(f.severity) <= min_idx]
