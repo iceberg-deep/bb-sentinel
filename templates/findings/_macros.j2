@@ -1,0 +1,34 @@
+{# Shared macro for rendering one finding section. All per-class templates
+   import this and supply the class-specific impact / validation / note text. #}
+{% macro section(idx, finding, severity_label, repro_curl, impact, validation, note=none, suggested_title=none) -%}
+### {{ idx }}. {{ suggested_title or finding.title }}
+
+**Severity:** {{ severity_label }}
+**Affected URL:** `{{ finding.url }}`
+**Detection:** `{{ finding.probe }}` → `{{ finding.signal }}`
+
+**Impact:**
+
+{{ impact }}
+
+**Reproduction:**
+
+```bash
+{{ repro_curl }}
+```
+
+**Evidence (response excerpt):**
+
+```
+{{ (finding.evidence or '(no evidence captured)')[:500] }}
+```
+
+**Triage validation:**
+
+{{ validation }}
+{%- if note %}
+
+> **Triage note:** {{ note }}
+{%- endif %}
+
+{% endmacro %}

@@ -1,0 +1,30 @@
+{% from '_macros.j2' import section %}
+{% set ip = finding.extra.get('ip') or '(see evidence)' %}
+{% set host = finding.extra.get('host') or '(see evidence)' %}
+{% set asn = finding.extra.get('asn') or '?' %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="Origin IP `" ~ ip ~ "` for `" ~ host ~ "` reachable directly — bypasses CDN/WAF",
+    impact=(
+"The hostname `" ~ host ~ "` is fronted by a CDN/WAF in normal browser flow, but its origin IP `" ~ ip ~ "` (ASN " ~ (asn|string) ~ ", "
+"outside the CDN/WAF block) is reachable on the public internet. An attacker who knows the origin IP can "
+"send traffic directly to it with a forged `Host:` header, completely bypassing the WAF rules, rate limiting, "
+"bot scoring, and IP-reputation logic that the CDN provides. **Impact compounds** with any vulnerability that the "
+"WAF was masking — XSS payloads, SQLi, path traversal, even slow-loris / DoS-class issues that the CDN normally "
+"absorbs become directly exploitable against origin."
+),
+    validation=(
+"1. Curl the origin IP with the production `Host:` header and compare the response to the CDN-fronted path:\n"
+"   `curl -k -H 'Host: " ~ host ~ "' https://" ~ ip ~ "/`\n"
+"2. Confirm the response is the application content (not nginx default page, not an unrelated app).\n"
+"3. Try a request that would normally be WAF-blocked through the CDN (e.g. a known SQLi probe in a query string) "
+"   to **prove the WAF is being bypassed**. This is the impact demonstration the program will want.\n"
+"4. If the program scope explicitly includes the underlying server (not just the domain), the origin-IP finding "
+"   can be reported on its own. Otherwise pair it with a downstream exploitable issue."
+),
+    note=(
+"This is a high-quality WAF-bypass finding when validated. Common downgrades: (a) the IP is a public-facing tier-1 "
+"server (e.g., a different product on the same range, not the CDN's origin for this host), or (b) the org has "
+"origin-cloaking IP allow-lists and the direct request is dropped at the firewall. Run the validation curl before "
+"submitting — programs reject this class on ~30% of reports for one of those two reasons."
+)
+) }}

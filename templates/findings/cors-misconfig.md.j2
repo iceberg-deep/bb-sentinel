@@ -1,0 +1,23 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    impact=(
+"The endpoint returns CORS headers that allow credentialed cross-origin reads from origins the application "
+"should not trust. Concrete attack: an attacker-controlled origin can make authenticated requests on behalf "
+"of a logged-in victim (using their session cookie / bearer token), read the response, and exfiltrate it. "
+"Impact compounds with any endpoint that returns sensitive data (PII, tokens, account state). For null-origin "
+"or `*`-with-credentials misconfigurations, every cross-site script or sandboxed iframe becomes an exfil channel."
+),
+    validation=(
+"1. Replay the request with `Origin: https://attacker.example.com` and inspect the response headers. The finding "
+"   is real only if `Access-Control-Allow-Origin` reflects the attacker origin **and** `Access-Control-Allow-Credentials: true`.\n"
+"2. Confirm the endpoint actually returns sensitive data when called with valid credentials — a CORS-misconfig on "
+"   a public-info endpoint is not payable.\n"
+"3. Build a minimal HTML PoC (single `fetch()` with credentials) that demonstrates exfil to the attacker origin.\n"
+"4. **Do not** test the PoC against a real user's session unless you control both sides. Test in your own browser "
+"   with your own session cookie."
+),
+    note=(
+"Programs reward CORS findings tied to **specific sensitive endpoints**, not site-wide policies. \"GET /api/account "
+"is exfiltrable\" is paid; \"the app sets CORS wrong\" is closed informational."
+)
+) }}

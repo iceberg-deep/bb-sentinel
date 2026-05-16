@@ -1,0 +1,48 @@
+{% from '_macros.j2' import section %}
+{% set version = finding.extra.get('version') or '(unspecified)' %}
+{% set _cves_raw = finding.extra.get('cves') or [] %}
+{% set cve_list = [] %}
+{% for c in _cves_raw %}{% if c is mapping %}{{ cve_list.append(c.get('id') ~ ' (' ~ c.get('severity', '?') ~ ')') or '' }}{% else %}{{ cve_list.append(c|string) or '' }}{% endif %}{% endfor %}
+{{ section(idx, finding, severity_label, repro_curl,
+    impact=(
+({
+"tomcat-examples-exposed":
+"Apache Tomcat's `/examples/` directory is reachable to anonymous users. This directory ships with JSP demo apps "
+"that include `SessionExample.jsp` (lets attackers add/remove arbitrary session attributes, including "
+"impersonation tokens) and `CookieExample.jsp` (cookie injection / XSS surface). On any application that uses "
+"Tomcat session attributes for authorization, this is a direct authn/authz bypass primitive.",
+"tomcat-snoop":
+"Tomcat's `snoop.jsp` is reachable. It reveals server-internal request details (headers, env, server name, request "
+"attributes) — useful for **privilege boundary discovery**: it can leak internal infrastructure hostnames, "
+"upstream proxy identifiers, and configuration drift between the front WAF and the Tomcat backend.",
+"tomcat-docs":
+"Tomcat's `/docs/` is reachable, confirming a stale default install. This pins the Tomcat *minor* version and "
+"often the exact build, enabling targeted CVE lookups. On its own it is informational, but combined with any "
+"version-vulnerable signal it strengthens the case.",
+"tomcat-version-vulnerable":
+"The Tomcat version (`" ~ version ~ "`) is known to be vulnerable to public CVEs: " ~ (cve_list|join(', ') if cve_list else 'see Apache Tomcat security advisories') ~ ". "
+"Impact depends on which CVE applies (RCE via CVE-2020-1938 ghostcat, request smuggling, info disclosure). "
+"Programs typically pay for **demonstrated exploitation**, not for the version-string disclosure alone.",
+"tomcat-examples":
+"Tomcat default examples directory is exposed (likely `/examples/`). Same impact as `tomcat-examples-exposed` "
+"above: shipped JSPs include session-attribute manipulation primitives."
+}.get(finding.signal, "Apache Tomcat default content / version-vulnerable signal. Impact depends on the specific signal: "
+                       "examples directory = session-manipulation primitive, vulnerable version = CVE chain, "
+                       "snoop/docs = info disclosure."))
+),
+    validation=(
+"1. Confirm the JSP **actually executes**, not just returns HTML for an unrelated host. If `/examples/jsp/snp/snoop.jsp` "
+"renders the actual snoop output, the Tomcat backend is reachable.\n"
+"2. For `tomcat-version-vulnerable`: look up the disclosed version against Apache's official security pages "
+"(`https://tomcat.apache.org/security-<N>.html`). Cross-reference CVE-2020-1938 / CVE-2022-25762 etc.\n"
+"3. For `tomcat-examples-exposed`: test `SessionExample.jsp` with a session ID. If you can add an attribute and "
+"see it reflected in `/examples/sessions/` on a fresh request, you have the demo.\n"
+"4. **Do not** run public RCE PoCs against the host without explicit program authorization — version-disclosure + "
+"theoretical impact is the safer submission."
+),
+    note=(
+"Programs increasingly downgrade \"Tomcat version-vulnerable\" to informational without a working PoC. The "
+"upgraded version of this finding is: chain the examples directory with an authentication bypass, or demonstrate "
+"the snoop output reveals real internal infrastructure paths. Plain version disclosure pays $0–$200 at best."
+)
+) }}

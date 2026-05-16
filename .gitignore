@@ -3,7 +3,11 @@ config/programs.yaml
 config/global.yaml
 config/*.inscope
 config/*.scope
+config/*.rules.txt
 !config/tmobile.scope
+
+# Engagement-specific helper scripts (per-program target curation)
+scripts/six_*.py
 .env
 .env.*
 !.env.example

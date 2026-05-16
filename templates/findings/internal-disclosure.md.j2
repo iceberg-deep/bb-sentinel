@@ -1,0 +1,23 @@
+{% from '_macros.j2' import section %}
+{% set host_disclosed = finding.extra.get('host') or finding.extra.get('hostname') or '(see evidence)' %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="Internal hostname `" ~ host_disclosed ~ "` disclosed in JS bundle on " ~ finding.url.split('/')[2],
+    impact=(
+"A JavaScript bundle served to anonymous users references an internal hostname (or non-public IP). On its own this "
+"is a **low-severity information disclosure**, but it is a high-value feeder finding: every disclosed hostname is "
+"a candidate for direct probing, host-header injection, or origin-IP discovery. Programs vary widely on payout — "
+"some pay $50–$200 for clean disclosure, others reject as informational."
+),
+    validation=(
+"1. Confirm the disclosed hostname is **not** a public marketing domain (some orgs reference their own marketing "
+"infrastructure in JS, which is irrelevant).\n"
+"2. Probe the disclosed host directly: does it resolve, does it respond, what auth does it require?\n"
+"3. If the disclosed host is internal/staging and **reachable from the public internet**, that is the real finding — "
+"open an additional report on the reachable internal host with this disclosure as supporting context.\n"
+"4. If unreachable but resolves, document the DNS resolution as the evidence chain."
+),
+    note=(
+"Submission strategy: lead with **impact**, not disclosure. \"Internal staging service `X` is reachable from the "
+"public internet (referenced in JS bundle Y)\" gets paid; \"`X` is in a JS file\" gets closed informational."
+)
+) }}

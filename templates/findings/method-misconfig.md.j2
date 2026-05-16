@@ -1,0 +1,47 @@
+{% from '_macros.j2' import section %}
+{% set method = finding.extra.get('method') or finding.signal.split('-')[1].upper() if '-' in finding.signal else '?' %}
+{% set status = finding.extra.get('status') or '?' %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="HTTP method `" ~ method ~ "` accepted on " ~ finding.url.split('/')[2] ~ " — " ~ ({
+        "PUT": "potential arbitrary file write",
+        "DELETE": "potential resource deletion",
+        "MOVE": "potential filesystem manipulation via WebDAV",
+        "PATCH": "unexpected mutation surface",
+        "CONNECT": "potential SSRF proxy primitive",
+    }.get(method, "unexpected method surface")),
+    impact=(
+({
+"PUT":
+"`PUT` returned a success-class status, suggesting the server may accept arbitrary file uploads at this path. "
+"If a writable webroot is exposed via PUT, an attacker can upload a shell (`.jsp`, `.php`, `.asp`) and "
+"escalate to RCE. Even when PUT is rejected at the file level, an accepting status often indicates a "
+"WebDAV-style configuration that is misconfigured at one or more sibling paths.",
+"DELETE":
+"`DELETE` returned a success-class status. If the application's authorization layer does not strictly bind DELETE "
+"to authenticated owners, an attacker can remove resources (objects, records, files) without authentication or "
+"with cross-user authority. This is an authn/authz bypass primitive.",
+"MOVE":
+"`MOVE` is a WebDAV verb. Acceptance suggests Microsoft IIS / Apache WebDAV is enabled, which often enables file "
+"renaming / overwrite primitives that lead to webroot manipulation and RCE.",
+"CONNECT":
+"`CONNECT` returned a status other than the default reject. If the server tunnels CONNECT requests, it can be "
+"abused as an open proxy (forward arbitrary TCP traffic through the server, potentially into the internal "
+"network). This is an SSRF-class primitive."
+}.get(method, "Unusual HTTP method accepted. Investigate the response body for whether the method was actually "
+                "honored (resource created/modified/proxied) versus merely receiving a non-default error status."))
+),
+    validation=(
+"1. Confirm the response status (`" ~ (status|string) ~ "`) actually indicates **acceptance**, not just \"reached the server.\" "
+"A `405 Method Not Allowed` returned by nginx is the *correct* rejection — that is **not a finding**.\n"
+"2. For PUT: attempt to write a small test file (e.g., `curl -X PUT --data 'test' " ~ finding.url ~ "test.txt`) and "
+"GET it back. **Only do this on a path you are confident does not affect production data**, e.g., a random path "
+"that returns 404 on GET.\n"
+"3. For CONNECT: attempt `curl -x http://" ~ finding.url.split('/')[2] ~ " http://example.com/` — if the proxy "
+"works, the host is an open-proxy / SSRF primitive.\n"
+"4. Programs reject this class hard when the success status is actually a friendly error. Inspect the body."
+),
+    note=(
+"Common false positive: many servers return a 405 page with the word \"accepted\" in HTML, or return 200 with "
+"a JSON error body. The probe flags the status code, but the **body content** decides whether this is real."
+)
+) }}

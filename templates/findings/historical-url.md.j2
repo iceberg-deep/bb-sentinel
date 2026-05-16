@@ -1,0 +1,24 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="Wayback-archived URL still live on " ~ finding.url.split('/')[2] ~ " — potentially abandoned endpoint",
+    impact=(
+"This URL was discovered in the Internet Archive's wayback corpus and **still responds with a non-404 status** "
+"despite being absent from the current navigation. Abandoned endpoints are high-value: they tend to skip the "
+"hardening that current paths receive — older auth checks, looser CORS, no rate limit, missing CSRF protection, "
+"or debug functionality that was \"hidden\" rather than deleted. Common downstream findings: admin debug consoles, "
+"file-upload handlers, account-impersonation switches, deprecated API versions without auth enforcement."
+),
+    validation=(
+"1. Visit the URL in a browser and inspect what it actually does. If it's a marketing page, it's noise.\n"
+"2. If it's an interactive endpoint, test authentication: does it require login? Same session as current site? "
+"Different role?\n"
+"3. Check the wayback snapshot dates: how long ago was this URL active? Old endpoints (>2 years) are most often "
+"vulnerable.\n"
+"4. Look for parameter-based functionality: `?debug=1`, `?admin=1`, `?id=<n>`. Deprecated endpoints often retain "
+"these dev flags."
+),
+    note=(
+"This template is for the wayback discovery itself, which is informational. The submission target is whatever you "
+"find by probing the URL — the wayback evidence is the *origin story* for the real finding, not the finding."
+)
+) }}

@@ -1,0 +1,25 @@
+{% from '_macros.j2' import section %}
+{% set bypass_method = finding.extra.get('method') or finding.extra.get('technique') or 'see evidence' %}
+{{ section(idx, finding, severity_label, repro_curl,
+    suggested_title="403/401 bypass on " ~ finding.url ~ " via " ~ (bypass_method|string),
+    impact=(
+"A path that returns 403 / 401 through the normal request flow is reachable via a bypass technique (path-segment "
+"trick, header injection, alternative method, or proxy-confusion). The protected content is now accessible without "
+"the authentication / authorization the developer expected. Severity depends entirely on **what the protected path "
+"actually exposes**: admin panel → critical, debug endpoint → high, internal API → high, static directory listing → "
+"medium/low."
+),
+    validation=(
+"1. Confirm the bypass response actually returns the protected content, not just a different error page.\n"
+"2. Diff the bypassed response against an authenticated response from a low-privilege user. If they match, the "
+"   bypass is real but the content is non-sensitive.\n"
+"3. Identify exactly **what data / functionality** the bypassed path exposes. The impact statement in your "
+"   submission must be `<specific data> / <specific action> exposed`, not `403 bypassed`.\n"
+"4. Test whether the bypass is reproducible from a clean IP (sometimes WAFs whitelist your IP after early probes, "
+"   making the bypass an artifact of your testing flow rather than a real issue)."
+),
+    note=(
+"This finding class is downgraded hard when the \"protected\" path doesn't actually contain anything sensitive. "
+"Confirm the impact before reporting — \"the path returns content\" is not enough."
+)
+) }}

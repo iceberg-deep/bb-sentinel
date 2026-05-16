@@ -1,0 +1,18 @@
+{% from '_macros.j2' import section %}
+{{ section(idx, finding, severity_label, repro_curl,
+    impact=(
+"This finding does not have a class-specific template. The severity rating (" ~ severity_label ~ ") reflects the "
+"probe's own assessment. Review the evidence below and frame the impact in terms of: what data or functionality "
+"is exposed that should not be, and what an attacker can do with it."
+),
+    validation=(
+"1. Reproduce the curl above and confirm the response matches the evidence excerpt.\n"
+"2. Determine the impact: what does this enable? Who can trigger it?\n"
+"3. If the impact is unclear, the finding is most likely not submission-quality — generic templates exist as a "
+"   safety net, not a recommendation to submit. Skip if uncertain."
+),
+    note=(
+"This is the fallback template. If you find yourself submitting many findings via this template, it's worth "
+"adding a class-specific template in `templates/findings/<class>.md.j2` to capture the impact framing."
+)
+) }}
