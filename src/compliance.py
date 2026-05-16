@@ -55,10 +55,16 @@ PROHIBITED_PATTERNS: list[tuple[str, str]] = [
      "explicit-no-automation"),
     (r"\bmanual\s+testing\s+only\b",
      "manual-testing-only"),
-    (r"\bautomated\s+(?:scanners?|tools?|testing)\s+(?:are\s+)?(?:strictly\s+)?prohibited\b",
+    (r"\bautomated\s+(?:scanning\s+)?(?:scanners?|tools?|testing)\b\s+(?:are\s+)?(?:strictly\s+)?prohibited\b",
      "automated-prohibited"),
-    (r"\bdo\s+not\s+(?:run|use|perform)\s+(?:any\s+)?automated\b",
+    # "Do not use/run/perform ... automated" — allow filler words between the
+    # verb and 'automated' to catch phrasings like
+    # "Do not use or report findings from automated scanning tools."
+    (r"\bdo\s+not\s+(?:run|use|perform|report\s+(?:findings\s+)?from)\b[^.]{0,80}\bautomated\b",
      "do-not-automated"),
+    # Standalone catch — "automated scanning tools" anywhere in a Rules section
+    (r"\bautomated\s+(?:scanning|vulnerability)\s+(?:tool|scanner)s?\b",
+     "automated-scanning-tools-mentioned"),
     (r"\bautomated\s+vulnerability\s+scanners?\b\s+(?:are\s+)?(?:not\s+)?(?:allowed|permitted)?(?:\s+prohibited)?",
      "vuln-scanner-mention"),
     # Prior approval required
@@ -106,6 +112,27 @@ RATE_LIMIT_PATTERNS: list[tuple[str, str]] = [
      "reasonable-use"),
 ]
 
+# Public-disclosure policy. Critical for signal-build strategy — researchers
+# who plan to puvendor-bh writeups need this to be permitted. The bounty-targets-
+# data dump's `allows_disclosure` field has been observed to misreport, so we
+# verify against the rules text.
+DISCLOSURE_FORBIDDEN_PATTERNS: list[tuple[str, str]] = [
+    (r"\bdoes\s+not\s+allow\s+disclosure\b",         "explicit-no-disclosure"),
+    (r"\bnon[\s-]?disclosure\b\s*[:.]",              "nondisclosure-header"),
+    (r"\bmay\s+not\s+release\s+information\b",       "no-release-info"),
+    (r"\bdisclosure\s+is\s+not\s+permitted\b",       "no-disclosure-permitted"),
+    (r"\bwithout\s+written\s+(?:authorization|approval|consent)\s+from\s+(?:us|the\s+company|the\s+team)\s+(?:to\s+)?disclos",
+     "no-disclosure-without-approval"),
+]
+DISCLOSURE_ALLOWED_PATTERNS: list[tuple[str, str]] = [
+    (r"\b(?:public\s+)?disclosure\s+is\s+(?:allowed|permitted|encouraged)\b",
+     "disclosure-allowed"),
+    (r"\bcoordinated\s+disclosure\b",
+     "coordinated-disclosure"),
+    (r"\bafter\s+(?:\d+|ninety|sixty)\s+days?\s+(?:you\s+may|public\s+disclosure)",
+     "time-based-disclosure"),
+]
+
 
 # Verdict precedence: any BLOCK > any WARN > UNCLEAR > OK
 # - any PROHIBITED match without a covering PERMITTED match → BLOCK
@@ -128,6 +155,10 @@ class ComplianceCheck:
     prohibitions: list[ComplianceMatch] = field(default_factory=list)
     allowances:   list[ComplianceMatch] = field(default_factory=list)
     rate_limits:  list[ComplianceMatch] = field(default_factory=list)
+    # Disclosure policy is detected separately — doesn't change BLOCK/WARN
+    # verdict but is critical strategy info that platform metadata may misreport.
+    disclosure_status: str = "UNKNOWN"   # "FORBIDDEN" | "ALLOWED" | "UNKNOWN"
+    disclosure_matches: list[ComplianceMatch] = field(default_factory=list)
     fetch_error:  str | None = None
     text_length:  int = 0
 
@@ -143,6 +174,7 @@ class ComplianceCheck:
             lines.append(f"Fetch error: {self.fetch_error}")
         else:
             lines.append(f"Text length: {self.text_length} chars")
+        lines.append(f"Disclosure: {self.disclosure_status}")
         if self.prohibitions:
             lines.append("\nProhibitions found:")
             for m in self.prohibitions:
@@ -150,6 +182,10 @@ class ComplianceCheck:
         if self.allowances:
             lines.append("\nAllowances found:")
             for m in self.allowances:
+                lines.append(f"  [{m.signal}] {m.quoted_context!r}")
+        if self.disclosure_matches:
+            lines.append("\nDisclosure-policy matches:")
+            for m in self.disclosure_matches:
                 lines.append(f"  [{m.signal}] {m.quoted_context!r}")
         if self.rate_limits:
             lines.append("\nRate-limit guidance:")
@@ -182,6 +218,17 @@ def assess_text(text: str, source: str = "<text>") -> ComplianceCheck:
     prohibitions = _scan_patterns(text_lower, PROHIBITED_PATTERNS)
     allowances   = _scan_patterns(text_lower, PERMITTED_PATTERNS)
     rate_limits  = _scan_patterns(text_lower, RATE_LIMIT_PATTERNS)
+    disc_forbid  = _scan_patterns(text_lower, DISCLOSURE_FORBIDDEN_PATTERNS)
+    disc_allow   = _scan_patterns(text_lower, DISCLOSURE_ALLOWED_PATTERNS)
+
+    # Disclosure status — forbidden wins over allowed if both match
+    if disc_forbid:
+        disclosure_status = "FORBIDDEN"
+    elif disc_allow:
+        disclosure_status = "ALLOWED"
+    else:
+        disclosure_status = "UNKNOWN"
+    disclosure_matches = disc_forbid + disc_allow
 
     # Verdict computation
     has_block = any(p.signal != "requires-prior-approval" for p in prohibitions)
@@ -208,6 +255,8 @@ def assess_text(text: str, source: str = "<text>") -> ComplianceCheck:
         prohibitions=prohibitions,
         allowances=allowances,
         rate_limits=rate_limits,
+        disclosure_status=disclosure_status,
+        disclosure_matches=disclosure_matches,
         text_length=len(text),
     )
 
