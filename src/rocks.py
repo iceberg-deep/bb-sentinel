@@ -829,6 +829,25 @@ class OriginCandidateProbe(DeepScanProbe):
             return []
         # Reduce to registered domains (last two labels) for the CT query
         roots = sorted({".".join(h.split(".")[-2:]) for h in hosts if "." in h})
+
+        # CDN-aware filter: if the program's *primary* hosts aren't already
+        # behind a CDN/WAF, the whole "origin candidate" concept is moot —
+        # the hostnames already point at the origin. Check the tech list
+        # from each probe; if no CDN/WAF signal across all live hosts,
+        # skip the probe with a log line.
+        CDN_TECH_MARKERS = ("cloudflare", "akamai", "fastly", "cloudfront",
+                            "azure front door", "imperva", "sucuri",
+                            "datadome", "barracuda")
+        cdn_seen = False
+        for p in probes:
+            techs = " ".join(p.get("technologies") or []).lower()
+            if any(m in techs for m in CDN_TECH_MARKERS):
+                cdn_seen = True; break
+        if not cdn_seen:
+            log.info("origin-candidate skipped — no CDN/WAF detected in front of live hosts",
+                     hosts=len(hosts))
+            return []
+
         log.info("origin-candidate probe", roots=len(roots), live_hosts=len(hosts))
 
         # 1) Mine crt.sh per root domain — passive
