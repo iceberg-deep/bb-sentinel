@@ -15,11 +15,43 @@ Output: data/signal-build-targets.md (human-readable) and
         data/signal-build-targets.json (machine).
 """
 import json
+import time
+import urllib.request
 from pathlib import Path
 
-BC  = json.load(open("/tmp/bc_data.json"))
-INT = json.load(open("/tmp/intigriti_data.json"))
-YWH = json.load(open("/tmp/ywh_data.json"))
+# Cache bounty-targets-data dumps in the repo tree (gitignored), not /tmp.
+# TTL = 24h; refetch if older. This eliminates /tmp churn across re-runs
+# and survives reboots — we don't need to re-download every time.
+CACHE_DIR = Path("data/bounty-targets-cache")
+CACHE_TTL_HOURS = 24
+DUMP_URLS = {
+    "bugcrowd":  "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/bugcrowd_data.json",
+    "intigriti": "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/intigriti_data.json",
+    "yeswehack": "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/yeswehack_data.json",
+    "hackerone": "https://raw.githubusercontent.com/arkadiyt/bounty-targets-data/main/data/hackerone_data.json",
+}
+
+
+def cached_dump(platform: str) -> list:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = CACHE_DIR / f"{platform}.json"
+    if cache_path.exists():
+        age_h = (time.time() - cache_path.stat().st_mtime) / 3600
+        if age_h < CACHE_TTL_HOURS:
+            return json.loads(cache_path.read_text())
+        # else stale, refetch
+    url = DUMP_URLS.get(platform)
+    if url is None:
+        raise ValueError(f"unknown platform {platform!r}")
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = json.loads(r.read())
+    cache_path.write_text(json.dumps(data))
+    return data
+
+
+BC  = cached_dump("bugcrowd")
+INT = cached_dump("intigriti")
+YWH = cached_dump("yeswehack")
 
 # Approximate EUR→USD; programs published in EUR get noted, value compared
 # against USD-equivalent for sorting only.

@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -353,31 +354,41 @@ async def fetch_rules_headless(url: str, *, timeout: float = 45.0,
     if not binary:
         return "", ("no chromium-family binary found on PATH — "
                     "install chromium / chromium-browser / google-chrome")
-    cmd = [
-        binary,
-        "--headless",
-        "--disable-gpu",
-        "--no-sandbox",
-        f"--virtual-time-budget={virtual_time_ms}",
-        "--run-all-compositor-stages-before-draw",
-        "--dump-dom",
-        f"--user-agent={user_agent}",
-        url,
-    ]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+    # Use a managed tempdir for chromium's profile/data so we get guaranteed
+    # cleanup on exit (chromium's default profile dirs persist in /tmp and
+    # accumulate across runs otherwise). The other flags below suppress
+    # crash-reporter and breakpad sidecar processes — we don't need them.
+    with tempfile.TemporaryDirectory(prefix="bb-sentinel-headless-") as user_data_dir:
+        cmd = [
+            binary,
+            "--headless",
+            "--disable-gpu",
+            "--no-sandbox",
+            f"--user-data-dir={user_data_dir}",
+            "--disable-crash-reporter",
+            "--disable-breakpad",
+            "--disable-extensions",
+            "--no-first-run",
+            f"--virtual-time-budget={virtual_time_ms}",
+            "--run-all-compositor-stages-before-draw",
+            "--dump-dom",
+            f"--user-agent={user_agent}",
+            url,
+        ]
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return "", f"chromium headless timed out after {timeout}s"
-    except Exception as e:
-        return "", f"{type(e).__name__}: {e}"
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return "", f"chromium headless timed out after {timeout}s"
+        except Exception as e:
+            return "", f"{type(e).__name__}: {e}"
     if not stdout:
         return "", "chromium returned no output"
     return _strip_html(stdout.decode("utf-8", errors="replace")), None
