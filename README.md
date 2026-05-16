@@ -190,7 +190,41 @@ Use the standalone command for a one-off check:
 bb-sentinel compliance --url https://bugcrowd.com/engagements/something
 bb-sentinel compliance --file path/to/pasted-rules.txt
 bb-sentinel compliance --program evilcorp        # pulls from programs.yaml
+bb-sentinel compliance --url URL --force-headless   # skip httpx, render directly
+bb-sentinel compliance --url URL --no-headless      # disable the JS fallback
 ```
+
+### How it fetches JS-rendered policy pages
+
+Bugcrowd / HackerOne / Intigriti program briefs are SPAs — a plain `httpx`
+GET returns just the loader shell with no rules text in it. Manually pasting
+the policy each time defeats the point of an automated pre-flight, so the
+fetcher does this:
+
+1. First tries `httpx` (fast, no JS).
+2. If the response is shorter than 500 chars of stripped text (signature of
+   an unrendered SPA), or returns an error, auto-escalates to a headless
+   chromium fetch via `subprocess`.
+3. Headless chromium runs with `--virtual-time-budget=10000` so the SPA's
+   internal JS has 10 seconds of virtual time to populate the DOM before
+   it gets dumped with `--dump-dom`. Without that flag the dump captures
+   only the loader.
+4. The rendered HTML is stripped (scripts / styles / tags removed) and fed
+   to the same compliance pattern matcher used for pasted rules text.
+
+The headless fetch path adds no Python deps — it shells out to whichever
+chromium-family binary is on `$PATH` (`chromium`, `chromium-browser`,
+`google-chrome`, `google-chrome-stable`, or `chrome`). If none is present,
+the fetch falls back to UNCLEAR with an install hint in the error message.
+
+**Why this matters operationally:** the `bounty-targets-data` dumps that
+power [target curation](#target-curation--picking-what-to-point-bb-sentinel-at)
+*lie* about disclosure policy in observed cases (Bolt Technology, May 2026:
+dump said `allows_disclosure: True`, program brief actually said "This
+engagement does not allow disclosure"). The compliance check is now the
+single source of truth — it reads the rendered policy text directly, runs
+the disclosure-detection patterns alongside the automation patterns, and
+surfaces `Disclosure: ALLOWED / FORBIDDEN / UNKNOWN` in every check.
 
 The pre-flight runs automatically before `bb-sentinel scan <program>` and
 `bb-sentinel rocks --program <name>`. To skip after manual review:
