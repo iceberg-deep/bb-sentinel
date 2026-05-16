@@ -29,10 +29,12 @@ class NucleiTech(Discoverer):
         concurrency: int = 25,
         templates: str = "http/technologies",
         timeout: int = 1200,
+        rate_limit_rps: int | None = None,
     ) -> None:
         super().__init__(binary_path=binary_path, timeout=timeout)
         self.concurrency = concurrency
         self.templates = templates
+        self.rate_limit_rps = rate_limit_rps
 
     async def detect(self, urls: list[str]) -> dict[str, TechResult]:
         out: dict[str, TechResult] = {u: TechResult(url=u) for u in urls}
@@ -41,6 +43,10 @@ class NucleiTech(Discoverer):
         if not self.is_available():
             log.warning("nuclei binary not available", binary=self.binary_path)
             return out
+
+        effective_c = self.concurrency
+        if self.rate_limit_rps is not None:
+            effective_c = max(1, min(self.concurrency, self.rate_limit_rps * 2))
 
         cmd = [
             self.binary_path,
@@ -51,8 +57,10 @@ class NucleiTech(Discoverer):
             "-t",
             self.templates,
             "-c",
-            str(self.concurrency),
+            str(effective_c),
         ]
+        if self.rate_limit_rps is not None:
+            cmd += ["-rate-limit", str(self.rate_limit_rps)]
         rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(urls).encode())
         if rc != 0 and not stdout:
             err = stderr.decode(errors="replace")
