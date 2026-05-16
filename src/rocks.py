@@ -259,19 +259,56 @@ class DeepScanProbe:
     timeout: float = 8.0
 
     def __init__(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
-                 rate_limit_rps: int | None = None) -> None:
+                 rate_limit_rps: int | None = None,
+                 auth_headers: dict[str, str] | None = None,
+                 in_scope_hosts: frozenset[str] | None = None) -> None:
         self.client = client
         self.sem = semaphore
         # Per-program outbound RPS cap. Probes that shell out to subprocess
         # tools (nuclei, etc.) should pass this through to those tools'
         # own rate-limit flags so we don't violate program policy.
         self.rate_limit_rps = rate_limit_rps
+        # Auth headers carried per program. Scope-restricted: only sent on
+        # requests whose host is in `in_scope_hosts`. Prevents leaking the
+        # auth token to third-party CDNs and external JS hosts during
+        # js-mine / cors / etc.
+        self.auth_headers = auth_headers or {}
+        self.in_scope_hosts = in_scope_hosts or frozenset()
+
+    def _headers_for(self, url: str) -> dict[str, str]:
+        """Return auth headers iff the URL's host is in scope; else empty dict.
+
+        Used by the request helpers below so probes can do scope-aware auth
+        without each probe re-implementing the check.
+        """
+        if not self.auth_headers:
+            return {}
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(url).netloc.split(":")[0].lower()
+        except Exception:
+            return {}
+        if not host:
+            return {}
+        # Match on suffix so subdomains of in-scope roots also get auth
+        for in_scope in self.in_scope_hosts:
+            if host == in_scope or host.endswith("." + in_scope):
+                return dict(self.auth_headers)
+        return {}
 
     async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
         raise NotImplementedError
 
     async def _get(self, url: str, *, headers: dict | None = None,
                    follow: bool = False) -> httpx.Response | None:
+        # Merge program auth (scope-restricted) under any caller-supplied
+        # headers — caller wins on conflicts so probe-specific headers
+        # (e.g. CORS Origin overrides) still work.
+        scope_auth = self._headers_for(url)
+        if scope_auth:
+            merged = dict(scope_auth)
+            if headers: merged.update(headers)
+            headers = merged
         async with self.sem:
             try:
                 return await self.client.get(url, headers=headers,
@@ -692,6 +729,8 @@ class OwaspVulnsProbe(DeepScanProbe):
             cmd += ["-t", t]
         if self.rate_limit_rps is not None:
             cmd += ["-rate-limit", str(self.rate_limit_rps)]
+        for k, v in (self.auth_headers or {}).items():
+            cmd += ["-H", f"{k}: {v}"]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
@@ -1081,7 +1120,9 @@ class DeepScanner:
     def __init__(self, *, concurrency: int = 8, timeout: float = 8.0,
                  user_agent: str = "bb-sentinel-deepscan/0.1",
                  probes: Iterable[type[DeepScanProbe]] = DEFAULT_PROBES,
-                 rate_limit_rps: int | None = None) -> None:
+                 rate_limit_rps: int | None = None,
+                 auth_headers: dict[str, str] | None = None,
+                 in_scope_hosts: Iterable[str] | None = None) -> None:
         self.concurrency = concurrency
         self.timeout = timeout
         self.user_agent = user_agent
@@ -1090,6 +1131,11 @@ class DeepScanner:
         # Probes that shell out to nuclei pass this to nuclei's -rate-limit;
         # internal-httpx probes use it as a token-bucket budget hint.
         self.rate_limit_rps = rate_limit_rps
+        # Per-program auth — propagated to all probes. Python-side probes
+        # use in_scope_hosts to scope-restrict the headers (don't leak to
+        # CDNs); subprocess tools (nuclei) send globally.
+        self.auth_headers = auth_headers or {}
+        self.in_scope_hosts = frozenset((h or "").lower() for h in (in_scope_hosts or []))
 
     async def scan(self, probes: list[dict]) -> list[DeepScanFinding]:
         sem = asyncio.Semaphore(self.concurrency)
@@ -1101,7 +1147,12 @@ class DeepScanner:
         ) as client:
             results: list[DeepScanFinding] = []
             for cls in self.probe_classes:
-                probe = cls(client, sem, rate_limit_rps=self.rate_limit_rps)
+                probe = cls(
+                    client, sem,
+                    rate_limit_rps=self.rate_limit_rps,
+                    auth_headers=self.auth_headers,
+                    in_scope_hosts=self.in_scope_hosts,
+                )
                 try:
                     fs = await probe.run(probes)
                     log.info("probe done", probe=cls.name, findings=len(fs))

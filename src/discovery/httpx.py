@@ -28,12 +28,18 @@ class HttpxProbe(Discoverer):
     binary = "httpx"
 
     def __init__(self, binary_path: str | None = None, threads: int = 50,
-                 timeout: int = 600, rate_limit_rps: int | None = None) -> None:
+                 timeout: int = 600, rate_limit_rps: int | None = None,
+                 auth_headers: dict[str, str] | None = None) -> None:
         super().__init__(binary_path=binary_path, timeout=timeout)
         self.threads = threads
         # Cap per-second outbound to honor a program's published rate limit.
         # None = no explicit cap (still bounded by threads).
         self.rate_limit_rps = rate_limit_rps
+        # When set, every probe carries these headers — flips bb-sentinel
+        # from unauth-surface-only to auth-aware probing. Sent globally
+        # by the httpx subprocess (no per-host scope filter), so use a
+        # restricted-scope program config when this matters.
+        self.auth_headers = auth_headers or {}
 
     async def probe(self, hostnames: list[str]) -> list[ProbeResult]:
         if not hostnames:
@@ -62,6 +68,8 @@ class HttpxProbe(Discoverer):
         ]
         if self.rate_limit_rps is not None:
             cmd += ["-rate-limit", str(self.rate_limit_rps)]
+        for k, v in self.auth_headers.items():
+            cmd += ["-H", f"{k}: {v}"]
         rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(hostnames).encode())
         if rc != 0 and not stdout:
             log.error("httpx failed", rc=rc, stderr=stderr.decode(errors="replace")[:300])

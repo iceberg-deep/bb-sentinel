@@ -381,17 +381,29 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
     else:
         raise click.UsageError("supply --from-jsonl FILE or --program NAME")
 
-    # Honor per-program rate limit if we loaded from DB (--program mode).
+    # Honor per-program rate limit + auth when running via --program.
     program_rate_limit = None
+    program_auth: dict[str, str] = {}
+    program_in_scope: list[str] = []
     if program_name:
         app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
         cfg = app.programs.get(program_name)
-        if cfg and cfg.rate_limit_rps:
-            program_rate_limit = cfg.rate_limit_rps
-            click.echo(f"[rate-limit] honoring program cap: {program_rate_limit} RPS")
+        if cfg:
+            if cfg.rate_limit_rps:
+                program_rate_limit = cfg.rate_limit_rps
+                click.echo(f"[rate-limit] honoring program cap: {program_rate_limit} RPS")
+            if cfg.auth_headers:
+                program_auth = cfg.auth_headers
+                click.echo(f"[auth] propagating headers: {sorted(program_auth.keys())}")
+            # Use domain roots as the scope-restriction list. Python rocks
+            # probes only send auth headers to hosts ending in one of these.
+            program_in_scope = list(cfg.domains)
     click.echo(f"loaded {len(probes)} probe records → turning rocks")
-    scanner = DeepScanner(concurrency=concurrency, timeout=timeout,
-                          rate_limit_rps=program_rate_limit)
+    scanner = DeepScanner(
+        concurrency=concurrency, timeout=timeout,
+        rate_limit_rps=program_rate_limit,
+        auth_headers=program_auth, in_scope_hosts=program_in_scope,
+    )
     findings = await scanner.scan(probes)
     click.echo(f"rocks produced {len(findings)} findings")
 

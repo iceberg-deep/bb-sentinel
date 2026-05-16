@@ -30,11 +30,15 @@ class NucleiTech(Discoverer):
         templates: str = "http/technologies",
         timeout: int = 1200,
         rate_limit_rps: int | None = None,
+        auth_headers: dict[str, str] | None = None,
     ) -> None:
         super().__init__(binary_path=binary_path, timeout=timeout)
         self.concurrency = concurrency
         self.templates = templates
         self.rate_limit_rps = rate_limit_rps
+        # Auth headers propagated to nuclei via `-H "K: V"` flags.
+        # Sent globally by nuclei (no per-host scope), like httpx.
+        self.auth_headers = auth_headers or {}
 
     async def detect(self, urls: list[str]) -> dict[str, TechResult]:
         out: dict[str, TechResult] = {u: TechResult(url=u) for u in urls}
@@ -61,6 +65,8 @@ class NucleiTech(Discoverer):
         ]
         if self.rate_limit_rps is not None:
             cmd += ["-rate-limit", str(self.rate_limit_rps)]
+        for k, v in self.auth_headers.items():
+            cmd += ["-H", f"{k}: {v}"]
         rc, stdout, stderr = await self._run_cmd(cmd, stdin="\n".join(urls).encode())
         if rc != 0 and not stdout:
             err = stderr.decode(errors="replace")
