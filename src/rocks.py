@@ -785,6 +785,134 @@ class OwaspVulnsProbe(DeepScanProbe):
         return findings
 
 
+class OriginCandidateProbe(DeepScanProbe):
+    """WAF-bypass reconnaissance. For each host appearing in the probe set,
+    pull the cert-named SANs from crt.sh, DNS-resolve each unique hostname,
+    and flag any whose A records land on an ASN OUTSIDE the well-known
+    CDN/WAF block (Cloudflare 13335, Akamai 16625/20940/21342, Fastly 54113,
+    CloudFront 16509, etc.). Those non-CDN resolutions are likely **origin
+    IPs** — direct-probable, WAF-bypassable surface.
+
+    Zero traffic to the target during the CT pull. Per-host DNS lookups are
+    light. The findings are *leads*, not exploits — the operator manually
+    verifies with `curl -k -H "Host: target.com" https://CANDIDATE_IP/` and
+    checks whether the same app responds, indicating WAF bypass.
+
+    Doesn't replace Shodan/Censys for serious origin hunting — they index
+    full IPv4 space, we only see what's in CT. But it's free, async-safe,
+    and catches the easy mistakes.
+    """
+    name = "origin-candidate"
+
+    # ASNs operated by major CDN / WAF providers. Resolutions landing on
+    # these are "behind the WAF as expected." Resolutions OFF this list
+    # are origin candidates.
+    CDN_ASNS = frozenset({
+        13335,   # Cloudflare
+        16625,   # Akamai
+        20940,   # Akamai (other range)
+        21342,   # Akamai (other range)
+        54113,   # Fastly
+        16509,   # AWS / CloudFront
+        15169,   # Google (covers GCP edge)
+        8075,    # Microsoft (Azure Front Door)
+        209242,  # Cloudflare (another range)
+    })
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        from urllib.parse import urlparse
+        import socket
+        # Roots are the unique registered-domain portions of host fields
+        hosts = sorted({urlparse(p.get("url", "")).netloc.split(":")[0]
+                        for p in probes if p.get("url")})
+        if not hosts:
+            return []
+        # Reduce to registered domains (last two labels) for the CT query
+        roots = sorted({".".join(h.split(".")[-2:]) for h in hosts if "." in h})
+        log.info("origin-candidate probe", roots=len(roots), live_hosts=len(hosts))
+
+        # 1) Mine crt.sh per root domain — passive
+        cert_hosts: set[str] = set()
+        for root in roots[:5]:  # cap to avoid runaway CT queries
+            try:
+                r = await self.client.get(
+                    "https://crt.sh/",
+                    params={"q": f"%.{root}", "output": "json"},
+                    timeout=30,
+                )
+                if r.status_code != 200: continue
+                data = r.json() if r.text.strip().startswith("[") else []
+                for entry in data or []:
+                    name_value = entry.get("name_value") or ""
+                    for line in name_value.splitlines():
+                        h = line.strip().lower().lstrip("*.")
+                        if h and "*" not in h and (h == root or h.endswith("." + root)):
+                            cert_hosts.add(h)
+            except Exception as e:
+                log.warning("crt.sh fetch failed", root=root, err=str(e)[:120])
+
+        log.info("origin-candidate: ct hosts to resolve", count=len(cert_hosts))
+
+        # 2) Resolve + check ASN. Use threadpool for sync socket+http.
+        loop = asyncio.get_event_loop()
+
+        def resolve(host: str) -> list[str]:
+            try:
+                infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+                return sorted({i[4][0] for i in infos})
+            except Exception:
+                return []
+
+        async def lookup_asn(ip: str) -> int | None:
+            try:
+                r = await self.client.get(f"https://api.iplocation.net/?ip={ip}",
+                                           timeout=10)
+                if r.status_code != 200: return None
+                # iplocation.net is unreliable for ASN; use ipinfo.io fallback
+            except Exception:
+                pass
+            try:
+                r = await self.client.get(f"https://ipinfo.io/{ip}/json",
+                                           timeout=10)
+                if r.status_code != 200: return None
+                data = r.json()
+                org = data.get("org", "")
+                # "AS13335 Cloudflare, Inc."
+                if org.startswith("AS"):
+                    try: return int(org.split()[0][2:])
+                    except: return None
+            except Exception:
+                return None
+            return None
+
+        findings: list[DeepScanFinding] = []
+        sample = sorted(cert_hosts)[:60]   # cap to keep API budget reasonable
+        for host in sample:
+            ips = await loop.run_in_executor(None, resolve, host)
+            for ip in ips:
+                if ip.count(".") != 3:  # skip IPv6 for now
+                    continue
+                asn = await lookup_asn(ip)
+                if asn is None or asn in self.CDN_ASNS:
+                    continue
+                findings.append(DeepScanFinding(
+                    url=f"https://{ip}/", probe=self.name,
+                    signal="origin-candidate",
+                    severity="medium",
+                    title=f"{host} resolves to non-CDN ASN {asn} ({ip}) — likely origin",
+                    evidence=(f"{host} → {ip}\n"
+                              f"ASN {asn} is outside the CDN/WAF block "
+                              f"(CF/Akamai/Fastly/AWS/Azure/GCP).\n"
+                              f"Verify manually:  "
+                              f"curl -k -H 'Host: {host}' https://{ip}/"),
+                    extra={"host": host, "ip": ip, "asn": asn,
+                           "verification": f"curl -k -H 'Host: {host}' https://{ip}/"},
+                ))
+                break  # one finding per host, even if multi-IP
+        log.info("origin-candidate probe done", findings=len(findings))
+        return findings
+
+
 class BackupFileProbe(DeepScanProbe):
     """For each live URL that returned 200/static content, try common backup
     suffix variants. Catches `index.php.bak`, `app.js~`, `db.sql.gz` style
@@ -1111,7 +1239,8 @@ class JsSecretMine(DeepScanProbe):
 
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
-                  WaybackHistorical, JsSecretMine, OwaspVulnsProbe)
+                  WaybackHistorical, JsSecretMine,
+                  OriginCandidateProbe, OwaspVulnsProbe)
 
 
 class DeepScanner:
@@ -1168,6 +1297,7 @@ __all__ = [
     "PathSweep", "BackupFileProbe", "MethodEnumProbe",
     "Bypass403", "CorsProbe", "TomcatFingerprint",
     "WaybackHistorical", "JsSecretMine",
+    "OriginCandidateProbe", "OwaspVulnsProbe",
     "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
     "SEVERITY_ORDER", "SEVERITY_WEIGHT",
 ]
