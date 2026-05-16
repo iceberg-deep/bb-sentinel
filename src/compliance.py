@@ -31,7 +31,9 @@ responsible for reading the actual program terms.
 """
 from __future__ import annotations
 
+import asyncio
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -261,47 +263,138 @@ def assess_text(text: str, source: str = "<text>") -> ComplianceCheck:
     )
 
 
+CHROMIUM_BINARY_CANDIDATES = ("chromium", "chromium-browser",
+                              "google-chrome", "google-chrome-stable", "chrome")
+DEFAULT_BROWSER_UA = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+
+def find_chromium() -> str | None:
+    """Locate a chromium-family binary on PATH. Returns None if absent."""
+    for candidate in CHROMIUM_BINARY_CANDIDATES:
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
+
+
+def _strip_html(body: str) -> str:
+    """Roughly strip HTML tags / scripts / styles. Sufficient for keyword
+    matching against the compliance pattern tables, not for layout."""
+    body = re.sub(r"<script[^>]*>.*?</script>", " ", body,
+                  flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<style[^>]*>.*?</style>", " ", body,
+                  flags=re.IGNORECASE | re.DOTALL)
+    body = re.sub(r"<[^>]+>", " ", body)
+    body = re.sub(r"\s+", " ", body).strip()
+    return body
+
+
 async def fetch_rules(url: str, *, timeout: float = 20.0,
                       user_agent: str = "bb-sentinel-compliance/0.1") -> tuple[str, str | None]:
-    """Fetch a rules page and return (text-content, error). HTML is roughly
-    stripped via regex — sufficient for keyword matching, not for layout."""
+    """Fetch a rules page with httpx (fast, no JS). Returns (text, error)."""
     try:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True,
                                       headers={"User-Agent": user_agent}) as client:
             r = await client.get(url)
         if r.status_code != 200:
             return "", f"HTTP {r.status_code}"
-        # Strip scripts + tags; collapse whitespace
-        body = r.text or ""
-        body = re.sub(r"<script[^>]*>.*?</script>", " ", body,
-                      flags=re.IGNORECASE | re.DOTALL)
-        body = re.sub(r"<style[^>]*>.*?</style>", " ", body,
-                      flags=re.IGNORECASE | re.DOTALL)
-        body = re.sub(r"<[^>]+>", " ", body)
-        body = re.sub(r"\s+", " ", body).strip()
-        return body, None
+        return _strip_html(r.text or ""), None
     except Exception as e:
         return "", f"{type(e).__name__}: {e}"
 
 
-async def check_url(url: str) -> ComplianceCheck:
-    """Fetch + assess in one call."""
-    text, err = await fetch_rules(url)
-    if err:
+async def fetch_rules_headless(url: str, *, timeout: float = 45.0,
+                                user_agent: str = DEFAULT_BROWSER_UA,
+                                virtual_time_ms: int = 10000) -> tuple[str, str | None]:
+    """Render a page in headless chromium, dump the DOM, strip HTML.
+
+    Used as a fallback when ``fetch_rules`` returns suspiciously little text
+    (the page is a JS-rendered SPA — Bugcrowd / HackerOne / Intigriti briefs
+    all behave this way). The ``--virtual-time-budget`` flag fast-forwards
+    chromium's internal clock so SPA content has time to render before the
+    DOM is dumped; without it the dump captures only the loader shell.
+
+    No Python deps beyond stdlib — calls the system chromium binary via
+    subprocess so this stays a portable bb-sentinel concern, not a
+    Playwright/Selenium pin.
+    """
+    binary = find_chromium()
+    if not binary:
+        return "", ("no chromium-family binary found on PATH — "
+                    "install chromium / chromium-browser / google-chrome")
+    cmd = [
+        binary,
+        "--headless",
+        "--disable-gpu",
+        "--no-sandbox",
+        f"--virtual-time-budget={virtual_time_ms}",
+        "--run-all-compositor-stages-before-draw",
+        "--dump-dom",
+        f"--user-agent={user_agent}",
+        url,
+    ]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return "", f"chromium headless timed out after {timeout}s"
+    except Exception as e:
+        return "", f"{type(e).__name__}: {e}"
+    if not stdout:
+        return "", "chromium returned no output"
+    return _strip_html(stdout.decode("utf-8", errors="replace")), None
+
+
+async def check_url(url: str, *, force_headless: bool = False,
+                    no_headless: bool = False) -> ComplianceCheck:
+    """Fetch a rules URL + assess. Auto-falls-back to headless chromium when
+    plain httpx returns a too-short body (the signature of a JS-rendered SPA).
+
+    Set ``force_headless=True`` to skip the httpx attempt entirely.
+    Set ``no_headless=True`` to keep the httpx-only behavior (useful when the
+    operator wants UNCLEAR rather than running a local browser).
+    """
+    text, err, source_note = "", None, url
+    if not force_headless:
+        text, err = await fetch_rules(url)
+
+    # Decide whether to escalate to headless
+    needs_headless = (
+        force_headless
+        or (err is not None)
+        or (len(text) < 500)   # SPA shells are typically <500 chars after stripping
+    )
+    if needs_headless and not no_headless:
+        log.info("compliance: escalating to headless chromium",
+                 url=url, plain_text_len=len(text), plain_err=err)
+        h_text, h_err = await fetch_rules_headless(url)
+        if not h_err and len(h_text) >= 500:
+            text, err = h_text, None
+            source_note = url + " (headless-rendered)"
+        elif h_err:
+            # Headless failed; surface what we have. err prefers original message.
+            err = err or h_err
+
+    if err and len(text) < 200:
         return ComplianceCheck(
             source=url, verdict="UNCLEAR",
             fetch_error=err, text_length=len(text),
         )
     if len(text) < 200:
-        # JS-rendered page or extremely short — can't trust the assessment
-        result = ComplianceCheck(
+        return ComplianceCheck(
             source=url, verdict="UNCLEAR",
-            fetch_error=f"text too short ({len(text)} chars) — likely JS-rendered",
+            fetch_error=f"text too short ({len(text)} chars) — JS-rendered and headless unavailable",
             text_length=len(text),
         )
-        return result
-    result = assess_text(text, source=url)
-    return result
+    return assess_text(text, source=source_note)
 
 
 def check_file(path: str | Path) -> ComplianceCheck:

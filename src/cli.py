@@ -197,14 +197,23 @@ async def scan(ctx: click.Context, program_name: str, force: bool,
 @cli.command()
 @click.option("--url", "url", default=None, help="Fetch and assess a rules URL")
 @click.option("--file", "path", default=None, type=click.Path(exists=True, dir_okay=False),
-              help="Assess a pasted rules-text file (use this when the policy page is JS-rendered)")
+              help="Assess a pasted rules-text file (skips network fetch)")
 @click.option("--program", "program_name", default=None,
               help="Pull rules_url / rules_text from this program's config")
+@click.option("--force-headless", is_flag=True,
+              help="Skip the httpx attempt and go straight to headless chromium")
+@click.option("--no-headless", is_flag=True,
+              help="Disable the headless fallback (UNCLEAR if httpx returns too-short text)")
 @click.pass_context
 @_coro
 async def compliance(ctx: click.Context, url: str | None, path: str | None,
-                     program_name: str | None) -> None:
-    """Standalone compliance check — read program rules and decide if automation is OK."""
+                     program_name: str | None,
+                     force_headless: bool, no_headless: bool) -> None:
+    """Standalone compliance check — read program rules and decide if automation is OK.
+
+    Auto-renders JS-heavy SPA pages (Bugcrowd / H1 / Intigriti briefs) via
+    headless chromium when the plain HTTP fetch returns too-short text.
+    """
     if program_name:
         app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
         cfg = app.programs.get(program_name)
@@ -213,7 +222,11 @@ async def compliance(ctx: click.Context, url: str | None, path: str | None,
         path = getattr(cfg, "rules_text", None) or path
     if not url and not path:
         raise click.UsageError("supply --url URL, --file PATH, or --program NAME")
-    check = compliance_check_file(path) if path else await compliance_check_url(url)  # type: ignore[arg-type]
+    if path:
+        check = compliance_check_file(path)
+    else:
+        check = await compliance_check_url(url, force_headless=force_headless,
+                                            no_headless=no_headless)  # type: ignore[arg-type]
     click.echo(check.render())
     if check.is_blocking():
         raise SystemExit(2)
