@@ -48,6 +48,15 @@ class ProgramConfig(BaseModel):
     # the program's stated cap. Example: Plusgrade Loyalty's brief says
     # "throttle traffic to six requests per second or less".
     rate_limit_rps: int | None = None
+    # Per-program authenticated probing. Headers in this dict get propagated
+    # to every active-probe request bb-sentinel makes for this program —
+    # httpx + nuclei subprocesses (via -H "K: V"), python rocks client
+    # (via client.headers). Values support ${ENV_VAR} expansion so secrets
+    # don't have to sit in YAML. Example:
+    #   auth_headers:
+    #     Authorization: "Bearer ${EVILCORP_API_TOKEN}"
+    #     Cookie: "session=${EVILCORP_SESSION}"
+    auth_headers: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("domains")
     @classmethod
@@ -88,6 +97,9 @@ class AppConfig(BaseModel):
         if global_path and Path(global_path).exists():
             global_doc = _load_yaml(global_path) or {}
         _expand_env(global_doc)
+        # Per-program env expansion too — auth_headers like
+        # `Authorization: "Bearer ${EVILCORP_TOKEN}"` need to resolve at load.
+        _expand_env(programs_doc)
         programs_raw = programs_doc.get("programs", {}) if isinstance(programs_doc, dict) else {}
         programs: dict[str, ProgramConfig] = {}
         for name, body in (programs_raw or {}).items():

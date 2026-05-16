@@ -237,6 +237,74 @@ bb-sentinel scan evilcorp --yes                   # auto-confirm WARN/UNCLEAR
 This is *tooling* — not legal advice. The operator is still responsible for
 reading the actual program terms.
 
+## Authenticated probing
+
+The big unlock beyond unauth recon. Most paid bug-bounty findings live
+behind a login — IDOR / privilege-escalation / cross-tenant data leaks
+are invisible to anon probes. bb-sentinel can carry per-program auth
+through every active-probe layer.
+
+### Config
+
+`auth_headers` is a bag of HTTP headers in `programs.yaml`. Values
+support `${ENV_VAR}` expansion so secrets stay out of YAML:
+
+```yaml
+programs:
+  evilcorp:
+    domains: [evilcorp.com, evilcorp.io]
+    inscope_config: /app/config/evilcorp.scope
+    rate_limit_rps: 5
+    auth_headers:
+      Authorization: "Bearer ${EVILCORP_API_TOKEN}"
+      Cookie: "session=${EVILCORP_SESSION}; csrf=${EVILCORP_CSRF}"
+      X-API-Key: "${EVILCORP_API_KEY}"
+```
+
+`programs.yaml` is gitignored, so even literal values stay local — but
+env-var expansion is the recommended pattern. Export the secrets in
+your shell before running `bb-sentinel`:
+
+```bash
+export EVILCORP_API_TOKEN="eyJhbGc..."
+export EVILCORP_SESSION="abc123..."
+bb-sentinel scan evilcorp --force
+```
+
+### Propagation
+
+`auth_headers` flows through:
+
+| Layer | Mechanism | Scope behavior |
+|-------|-----------|----------------|
+| `httpx` subprocess (discovery probe) | `-H "Key: Value"` flags | **Global** — sent to every target the subprocess hits |
+| `nuclei` subprocess (tech-detect + OWASP vulns) | `-H "Key: Value"` flags | **Global** — same caveat |
+| Python `rocks` probes (path-sweep / cors / js-mine / etc.) | `httpx.AsyncClient` per-request header merge | **Scope-restricted** — only sent on requests whose host matches one of `domains:` (or a subdomain thereof). Third-party CDN / JS-bundle fetches do NOT carry auth — prevents token leakage during js-mine. |
+
+### Security notes
+
+- The subprocess tools (httpx, nuclei) send auth headers globally and
+  do not strip on cross-domain redirect. If an in-scope host redirects
+  to a third-party, your token follows. Mitigate by scoping
+  `domains:` tightly per program.
+- Python-side probes scope-restrict via the host-suffix match on
+  `domains:`. This covers `*.evilcorp.com` style wildcards correctly.
+- Never put real auth values into the example YAML or anywhere that
+  could be committed. Always go through environment variables.
+- Auth tokens rotate — bb-sentinel does no auto-refresh. When a scan
+  starts returning 401s, re-export and re-run.
+
+### Why this matters
+
+bb-sentinel's recon + rocks layer found mostly unauth surface
+(exposed `.git`/`.env`/admin panels) in the SIX engagement and would
+have surfaced more on Plusgrade. The bigger payouts —
+cross-tenant IDOR, account-takeover via stale session, server-side
+template injection in authenticated app — only become visible once
+the auth header rides every probe. This commit lights up that surface
+without forcing the operator to manually re-run each tool with the
+cookie attached.
+
 ## Target curation — picking what to point bb-sentinel at
 
 Half the battle is **choosing a program where your reports will actually be

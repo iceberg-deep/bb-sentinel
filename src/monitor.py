@@ -58,20 +58,27 @@ class ProgramScanner:
         program = await self._ensure_program_row(program_cfg)
         run = await self._start_run(program.id)
 
-        # If the program has a puvendor-bhed rate limit, rebuild the active-probe
-        # wrappers for this scan with that cap applied. Avoids violating
-        # program rules like Plusgrade's "≤6 RPS" clause.
+        # Rebuild active-probe wrappers per-program when there's any
+        # program-specific config (rate limit, auth headers) so we don't
+        # leak credentials across scans of different programs.
         g = self.app.global_
-        if program_cfg.rate_limit_rps is not None:
-            log.info("rate-limit applied", program=program_cfg.name,
-                     rps=program_cfg.rate_limit_rps)
+        if program_cfg.rate_limit_rps is not None or program_cfg.auth_headers:
+            if program_cfg.rate_limit_rps is not None:
+                log.info("rate-limit applied", program=program_cfg.name,
+                         rps=program_cfg.rate_limit_rps)
+            if program_cfg.auth_headers:
+                log.info("auth-aware probing enabled",
+                         program=program_cfg.name,
+                         header_names=sorted(program_cfg.auth_headers.keys()))
             self.httpx = HttpxProbe(
                 binary_path=g.tool("httpx"), threads=g.httpx_threads,
                 rate_limit_rps=program_cfg.rate_limit_rps,
+                auth_headers=program_cfg.auth_headers,
             )
             self.nuclei = NucleiTech(
                 binary_path=g.tool("nuclei"), concurrency=g.nuclei_concurrency,
                 rate_limit_rps=program_cfg.rate_limit_rps,
+                auth_headers=program_cfg.auth_headers,
             )
 
         try:
