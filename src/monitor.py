@@ -95,7 +95,7 @@ class ProgramScanner:
 
             # 1) Subdomain discovery (run sources in parallel)
             if prog:
-                with prog.phase(f"[{program_cfg.name}] discovery"):
+                with prog.phase(f"discovery — {program_cfg.name}"):
                     prog.step("subfinder", "enumerating subdomains…")
                     prog.step("assetfinder", "querying passive sources…")
                     prog.step("crt.sh", "mining CT logs…")
@@ -103,9 +103,9 @@ class ProgramScanner:
                     stats.errors.extend(disc.errors)
                     unique_hosts = sorted({h.hostname for h in disc.hosts if h.hostname})
                     stats.discovered_hosts = len(unique_hosts)
-                    prog.info(f"  → {len(unique_hosts)} unique hostnames discovered")
+                    prog.metric("unique hostnames", len(unique_hosts))
                     if disc.errors:
-                        prog.warn(f"{len(disc.errors)} discovery error(s) (non-fatal)")
+                        prog.warn(f"{len(disc.errors)} non-fatal discovery error(s)")
             else:
                 disc = await self._gather_subdomains(program_cfg.domains)
                 stats.errors.extend(disc.errors)
@@ -114,11 +114,12 @@ class ProgramScanner:
 
             # 2) Scope filter
             if prog:
-                with prog.phase(f"[{program_cfg.name}] scope filter"):
+                with prog.phase("scope filter"):
                     kept, _ = await scope.filter(unique_hosts)
                     dropped = len(unique_hosts) - len(kept)
-                    prog.info(f"  → kept {len(kept)} / {len(unique_hosts)} hosts "
-                              f"({dropped} dropped as out-of-scope)")
+                    prog.metric("in-scope", f"{len(kept)} / {len(unique_hosts)}")
+                    if dropped:
+                        prog.metric("dropped", dropped)
             else:
                 kept, _ = await scope.filter(unique_hosts)
 
@@ -129,15 +130,19 @@ class ProgramScanner:
             # 4) Probe with httpx — limit to new hosts + a refresh of known live hosts
             to_probe = sorted({a.hostname for a in new_assets} | await self._refresh_targets(program.id))
             if prog:
-                with prog.phase(f"[{program_cfg.name}] active probing"):
+                with prog.phase("active probing"):
                     if to_probe:
                         rps_note = f" at {program_cfg.rate_limit_rps} RPS" if program_cfg.rate_limit_rps else ""
                         prog.step("httpx", f"probing {len(to_probe)} hosts{rps_note}…")
+                        import time as _t
+                        _t0 = _t.monotonic()
                         probes = await self.httpx.probe(to_probe)
-                        prog.step("httpx", f"{len(probes)} live", ok=True)
+                        prog.step("httpx", f"{len(probes)} live hosts responded",
+                                  ok=True, duration=_t.monotonic()-_t0)
+                        prog.metric("live", len(probes))
                     else:
                         probes = []
-                        prog.info("  no hosts to probe (everything already baseline)")
+                        prog.info("    no hosts to probe (everything already baseline)")
             else:
                 probes = await self.httpx.probe(to_probe) if to_probe else []
             stats.live_probes = len(probes)
