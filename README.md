@@ -14,6 +14,7 @@ ones — surfacing report-ready findings while you sleep.
 - [Configuration](#configuration)
 - [Priority scoring](#priority-scoring)
 - [Rock-turning (deep scanning)](#rock-turning-deep-scanning)
+- [Report writing](#report-writing)
 - [Authenticated probing](#authenticated-probing)
 - [Compliance pre-flight](#compliance-pre-flight)
 - [Target curation](#target-curation)
@@ -34,6 +35,10 @@ ones — surfacing report-ready findings while you sleep.
   URLs to find exposed `.git`/`.env`/actuator/swagger, SQLi/LFI/RCE/SSRF
   via curated nuclei templates, subdomain takeovers, default creds,
   Tomcat-version CVE matches, CORS misconfigs, and more
+- **Writes the report** — `bb-sentinel report` turns scan output into
+  a submission-ready Markdown + PDF document. Per-class Jinja templates
+  frame impact, list triage-validation steps, and flag the common
+  downgrade traps that cause programs to close findings as informational
 - **Respects program rules** — compliance pre-flight reads each
   program's policy (with headless-rendered fallback for JS pages) and
   refuses to scan programs that prohibit automation; per-program rate
@@ -67,6 +72,13 @@ ones — surfacing report-ready findings while you sleep.
                                         └────────────│  rocks         │
                                                      │  (9 probes,    │
                                                      │  OWASP class)  │
+                                                     └────────┬───────┘
+                                                              │
+                                                     ┌────────▼───────┐
+                                                     │  report writer │
+                                                     │  (Markdown/PDF │
+                                                     │  Jinja per     │
+                                                     │  finding class)│
                                                      └────────────────┘
 ```
 
@@ -104,12 +116,15 @@ bb-sentinel/
 │   ├── scope.py         wrapper around tomnomnom/inscope
 │   ├── scoring.py       priority-score multiplier model
 │   ├── rocks.py         9-probe deep-scan toolkit
+│   ├── report.py        Markdown + PDF report generator (Jinja2)
 │   ├── webhooks.py      async webhook dispatch
 │   ├── cli.py           management CLI
 │   └── discovery/       per-tool wrappers (subfinder, httpx, nuclei, …)
 ├── scripts/
 │   ├── build_signal_list.py    cross-platform target curation
 │   └── batch_compliance.py     bulk pre-flight checker
+├── templates/
+│   └── findings/               per-class Jinja2 report templates
 ├── config/                     user config (gitignored)
 ├── data/                       cache, dumps, baselines (gitignored)
 └── docker-compose.yml          postgres + redis + sentinel
@@ -133,7 +148,12 @@ bb-sentinel scan <name> --force
 # 5. Deep probe — runs the 9-probe rocks toolkit against live URLs
 bb-sentinel rocks --program <name> --min-severity medium
 
-# 6. Continuous monitoring
+# 6. Write the report — turns rocks JSONL into a Markdown + PDF document
+bb-sentinel report --program <name>
+# → data/<name>-report.md  (paste into H1/Bugcrowd submission form)
+# → data/<name>-report.pdf (for programs that accept PDF deliverables)
+
+# 7. Continuous monitoring
 bb-sentinel run     # background loop, alerts via webhook on new findings
 ```
 
@@ -237,6 +257,69 @@ bb-sentinel rocks --program evilcorp --min-severity medium
 # Against any httpx-style JSONL of probe results
 bb-sentinel rocks --from-jsonl data/evilcorp-live.jsonl --min-severity high
 ```
+
+## Report writing
+
+The scan is only half the work — the report is what determines whether
+a program pays out, downgrades, or closes informational. `bb-sentinel
+report` turns rocks JSONL output into a submission-ready Markdown +
+PDF document with per-class impact framing.
+
+```bash
+# From program config (pulls domains, auth status, rate-limit into header)
+bb-sentinel report --program evilcorp
+# → data/evilcorp-report.md
+# → data/evilcorp-report.pdf
+
+# From a standalone JSONL (no program config needed)
+bb-sentinel report --from-jsonl data/scan.jsonl --out report.md --no-pdf
+
+# Tune the main/appendix split
+bb-sentinel report --program evilcorp --min-severity-main high
+# (medium findings move to Appendix A)
+```
+
+### What's in the output
+
+- **Executive summary** — severity histogram, host counts, compliance
+  and disclosure verdict
+- **Report-class findings** (medium+) — each with class-specific
+  impact paragraph, copy-pasteable curl reproduction, response-excerpt
+  evidence, triage-validation steps, and downgrade-trap notes
+- **Appendix A** — info-tier findings the operator can skip
+- **Appendix B** — scan methodology (tools, rate limit, auth status)
+
+### Per-class templates
+
+Each finding signal dispatches to a Jinja2 template in
+[`templates/findings/`](templates/findings/). Templates carry the
+class-specific impact language, validation checks, and submission
+strategy notes — so the report writes itself once the evidence is
+captured.
+
+| Template | Catches |
+|----------|---------|
+| `exposed-config.md.j2` | `.npmrc`, `.env`, `.git/config`, dotfiles |
+| `exposed-info.md.j2` | `robots.txt`, `sitemap.xml`, `security.txt` (appendix-tier) |
+| `internal-disclosure.md.j2` | Internal hostnames / IPs leaked in JS bundles |
+| `origin-candidate.md.j2` | WAF-bypass via direct origin-IP reachability |
+| `tomcat-vuln.md.j2` | Tomcat version-CVE, examples/, snoop/, docs/ |
+| `method-misconfig.md.j2` | PUT/DELETE/CONNECT accepted by the server |
+| `bypass-403.md.j2` | 403/401 bypass via path-segment or header tricks |
+| `cors-misconfig.md.j2` | Credentialed CORS reflection or null-origin |
+| `backup-file.md.j2` | `.bak` / `.zip` / `.swp` source/archive exposure |
+| `owasp-vuln.md.j2` | SQLi / XSS / LFI / SSRF / SSTI / RCE / IDOR / XXE |
+| `secret-leak.md.j2` | Hard-coded API keys / tokens in client bundles |
+| `historical-url.md.j2` | Wayback-archived URLs still live (forgotten endpoints) |
+| `generic.md.j2` | Fallback for unmapped signals |
+
+Adding a new class is one file: drop `templates/findings/<class>.md.j2`
+and add one entry to `_SIGNAL_TEMPLATE_MAP` in
+[`src/report.py`](src/report.py).
+
+PDF rendering uses [WeasyPrint](https://weasyprint.org/) (Letter page,
+severity badges, monospace evidence blocks). Disable with `--no-pdf`
+if you only need the Markdown for paste-into-form workflows.
 
 ## Authenticated probing
 
@@ -386,6 +469,8 @@ bb-sentinel status
 bb-sentinel run                                       # foreground monitor loop
 bb-sentinel rocks --program <name> [--min-severity medium]
 bb-sentinel rocks --from-jsonl <file.jsonl> [--min-severity high]
+bb-sentinel report --program <name> [--no-pdf] [--out PATH] [--min-severity-main S]
+bb-sentinel report --from-jsonl <rocks.jsonl> [--out PATH] [--no-pdf]
 bb-sentinel compliance --url <rules-url>
 bb-sentinel compliance --program <name>
 bb-sentinel compliance --file <pasted-rules.txt>
