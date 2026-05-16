@@ -105,10 +105,21 @@ class ProgramScanner:
             probes = await self.httpx.probe(to_probe) if to_probe else []
             stats.live_probes = len(probes)
 
-            # 5) Optional nuclei tech enrichment for new/interesting probes
+            # 5) Optional nuclei tech enrichment for new/interesting probes.
+            # nuclei timeouts / failures must NOT kill the scan — losing the
+            # httpx probes because the *enrichment* step failed is the worst
+            # possible outcome. Catch broadly here and fall through with an
+            # empty tech map; the scan still records findings from httpx.
             new_host_set = {a.hostname for a in new_assets}
             urls_to_enrich = [p.url for p in probes if p.host in new_host_set and p.url]
-            tech_map = await self.nuclei.detect(urls_to_enrich) if urls_to_enrich else {}
+            tech_map = {}
+            if urls_to_enrich:
+                try:
+                    tech_map = await self.nuclei.detect(urls_to_enrich)
+                except Exception as e:
+                    log.warning("nuclei tech-detect failed — continuing without enrichment",
+                                error=str(e)[:200])
+                    stats.errors.append(f"nuclei enrichment failed: {str(e)[:200]}")
 
             # 6) Persist findings + score + collect alerts
             alerts = await self._record_findings(program.id, probes, tech_map, scope_kept=set(kept))
