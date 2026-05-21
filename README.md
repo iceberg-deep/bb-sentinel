@@ -188,6 +188,15 @@ programs:
     no_write_methods: false   # disable PUT/POST/DELETE/PATCH probes
     rocks_enabled: true       # set false for discovery-only profiles
 
+    # Out-of-scope finding suppression (regex match on finding.signal)
+    exclude_finding_signals:
+      - "^xss.*"              # if program closes XSS as N/A
+      - "^open-redirect.*"
+
+    # Skip these nuclei template trees entirely (pre-filter; saves rate budget)
+    nuclei_exclude_trees:
+      - "http/vulnerabilities/redirect"
+
     scan_frequency: 1h
 
     webhooks:
@@ -222,6 +231,31 @@ you don't yet have approval to run deep probes.
 
 Both flags log a `[guardrail]` line at scan start so it's obvious from
 the run output which mode you're in.
+
+#### Out-of-scope finding suppression
+
+Two complementary filters keep findings the program won't accept out of
+the submission pipeline:
+
+**`exclude_finding_signals: list[str]`** — regex patterns matched
+against `DeepScanFinding.signal`. Findings whose signal starts with any
+of these are dropped *after* the probe runs but *before* the report
+writer sees them. The probe still does its work — only the report is
+filtered. Logged at INFO so you can see how much was filtered per
+probe. Use for vulnerability classes the program explicitly excludes
+from rewards (XSS, open-redirect, cache poisoning, missing headers,
+OPTIONS/TRACE, non-sensitive cookie flags, outdated libs without PoC).
+
+**`nuclei_exclude_trees: list[str]`** — nuclei template-tree subpaths
+removed from `OwaspVulnsProbe`'s scan set *before* nuclei runs. Pure
+pre-filter — these never get sent to the target, saving rate-limit
+budget. Pattern is the same as nuclei's standard layout (e.g.
+`http/vulnerabilities/redirect` to skip the entire open-redirect
+template tree).
+
+Use both: `nuclei_exclude_trees` for nuclei-class output you can predict
+upfront; `exclude_finding_signals` for the broader set of signals
+emitted across all rocks probes.
 
 ### `config/global.yaml`
 

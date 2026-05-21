@@ -443,11 +443,19 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
             program_in_scope = list(cfg.domains)
             program_no_write = cfg.no_write_methods
             program_rocks_enabled = cfg.rocks_enabled
+            program_exclude_signals = cfg.exclude_finding_signals
+            program_nuclei_exclude = cfg.nuclei_exclude_trees
             if program_no_write:
                 click.echo("[guardrail] no_write_methods: PUT/POST/DELETE/PATCH probes disabled")
             if not program_rocks_enabled:
                 click.echo("[guardrail] rocks_enabled: false — skipping deep scan entirely")
                 return
+            if program_exclude_signals:
+                click.echo(f"[oos-filter] suppressing finding signals matching: "
+                           f"{program_exclude_signals}")
+            if program_nuclei_exclude:
+                click.echo(f"[oos-filter] excluding nuclei trees: "
+                           f"{program_nuclei_exclude}")
     progress = ctx.obj.get("progress")
     if progress:
         progress.info(f"[rocks] {len(probes)} probe records loaded")
@@ -459,6 +467,10 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
         rate_limit_rps=program_rate_limit,
         auth_headers=program_auth, in_scope_hosts=program_in_scope,
         no_write_methods=program_no_write,
+        exclude_finding_signals=(program_exclude_signals
+                                  if program_name else None),
+        nuclei_exclude_trees=(program_nuclei_exclude
+                               if program_name else None),
         progress=progress,
     )
     if progress:
