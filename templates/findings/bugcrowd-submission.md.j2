@@ -1,0 +1,130 @@
+{#-
+  Bugcrowd submission template — structural placeholder.
+
+  Render via:
+      from jinja2 import Environment, FileSystemLoader
+      env = Environment(loader=FileSystemLoader("templates/findings"))
+      tmpl = env.get_template("bugcrowd-submission.md.j2")
+      print(tmpl.render(finding=f, repro_curl=f.reproduction_curl()))
+
+  This is the *per-finding* submission format. Many programs (Bugcrowd,
+  HackerOne, Intigriti) ship their own `submission-template.md` in the
+  brief Resources that may differ in section ordering, wording, or
+  required fields (e.g., Bugcrowd's VRT category dropdown, CVSS-vector
+  field). When the program publishes one, copy its exact section headers
+  in here — the headers below are the common-denominator Bugcrowd shape
+  as of 2026-Q2.
+
+  bb-sentinel's per-class templates in this directory provide richer
+  impact / triage / note content; if you want that material instead,
+  swap the {%-block-impact-%} placeholder for an include of the
+  signal-dispatched template.
+-#}
+**Vulnerability Title**
+
+{{ finding.title }}
+
+**Severity**
+
+{{ severity_label or finding.severity|title }}{% if finding.extra.get('vrt-category') %} — VRT: `{{ finding.extra['vrt-category'] }}`{% endif %}
+
+**Affected URL / Asset**
+
+`{{ finding.url }}`
+
+**Vulnerability Class**
+
+{{ finding.probe }} → `{{ finding.signal }}`
+
+---
+
+**Steps to Reproduce**
+
+{# Replace this with program-specific reproduction structure if needed.
+   The default is a single curl command derived from the finding's URL
+   plus any program-required auth headers (X-Bug-Bounty etc.). #}
+1. Send the following request:
+
+   ```bash
+   {{ repro_curl }}
+   ```
+
+2. Observe the response — relevant portion captured below under "Proof
+   of Concept".
+
+3. Confirm the finding by comparing the response against the expected
+   behavior described under "Impact".
+
+**Proof of Concept**
+
+```
+{{ (finding.evidence or "(no evidence captured)")[:2000] }}
+```
+
+{% if finding.extra %}
+**Additional context:**
+
+```yaml
+{% for k, v in finding.extra.items() -%}
+{{ k }}: {{ v }}
+{% endfor %}
+```
+{% endif %}
+
+---
+
+**Impact**
+
+{# SWAP-IN: program-specific impact framing. For programs that grade
+   on impact (T-Mobile, T-Mobile-style brief), explicitly tie the
+   finding to one of the program's reward categories — quote the
+   exact bounty-tier language so the triager can map it on first read. #}
+{% block impact -%}
+[Describe the security impact in concrete terms: what data is exposed,
+what actions an attacker can take, what business outcome is at risk.
+Use the program's own bounty-tier wording where possible — e.g., "Full
+Corporate Network Access" — so the triager can map this directly to a
+payout band on first read.]
+{%- endblock %}
+
+**Suggested Remediation**
+
+{% block remediation -%}
+[Programs vary on whether they want a remediation suggestion. For
+detection-class findings (exposed config files, default credentials,
+exposed admin panels), the remediation is usually obvious and a single
+sentence ("remove from public access" / "rotate the disclosed credential"
+/ "place behind authentication") is sufficient. For exploitation-class
+findings (RCE, deserialization, SSRF), defer to the program's security
+team unless you have specific patch-level knowledge.]
+{%- endblock %}
+
+---
+
+**Researcher attestation**
+
+{# Many briefs require explicit researcher attestation:
+   - "I did not access customer data beyond what was necessary to prove
+     the vulnerability"
+   - "I have not disclosed this vulnerability outside the program"
+   - "All requests originated from my designated test account / SIM /
+     MSISDN"
+   The placeholders below cover the T-Mobile-style brief. Adjust for
+   the actual program's wording. #}
+
+- All testing was performed against my own test accounts / designated
+  test assets, in compliance with the program's Rules of Engagement.
+- Custom request header `X-Bug-Bounty: BugCrowd-{{ bugcrowd_username
+  or '<your-username>' }}` was included on every automated request
+  (per the program's attribution requirement).
+- Rate limits were honored: {{ rate_limit_rps or '<rate-limit>' }}
+  requests/second aggregate.
+- Customer or personal information was {% if customer_data_accessed -%}
+  inadvertently accessed; details disclosed below under Inadvertent
+  Disclosure{% else %}NOT accessed at any point during testing{%- endif %}.
+
+{% if customer_data_accessed %}
+**Inadvertent Disclosure**
+
+{{ inadvertent_disclosure_text or "[Describe: what was accessed, when, how it was discovered, and confirmation that nothing was retained/copied/disclosed.]" }}
+{% endif %}
