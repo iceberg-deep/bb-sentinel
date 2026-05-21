@@ -71,6 +71,19 @@ class ProgramConfig(BaseModel):
     # rocks-tier active probing — e.g. internal-named zones, freshly
     # discovered scopes, or programs in a quiet observation phase.
     rocks_enabled: bool = True
+    # Findings whose `signal` matches any regex in this list are dropped
+    # before the report writer sees them. Use for OOS vulnerability
+    # classes (e.g., T-Mobile excludes XSS / open-redirect / cache-
+    # poisoning / missing-headers / OPTIONS-TRACE / cookie-flag — submitting
+    # these wastes the researcher's quota and the triager's time, and the
+    # program will close them N/A). Regex is matched at the start of the
+    # signal name; use `.*` suffix for prefix matching.
+    exclude_finding_signals: list[str] = Field(default_factory=list)
+    # Nuclei template-tree subpaths to REMOVE from OwaspVulnsProbe's
+    # default set. Pre-filter — these never get scanned, saving rate
+    # budget. Tree paths use nuclei's standard layout, e.g.
+    # "http/vulnerabilities/redirect" to exclude open-redirect templates.
+    nuclei_exclude_trees: list[str] = Field(default_factory=list)
 
     @field_validator("domains")
     @classmethod

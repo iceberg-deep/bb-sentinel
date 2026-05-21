@@ -745,7 +745,11 @@ class OwaspVulnsProbe(DeepScanProbe):
             "-severity", self.SEVERITY_FILTER,
             "-c", "15",
         ]
-        for t in self.TEMPLATE_TREES:
+        # Respect per-program tree exclusions (set by DeepScanner from
+        # ProgramConfig.nuclei_exclude_trees). Falls back to the class
+        # default if no override has been wired in.
+        trees = getattr(self, "template_trees_override", None) or self.TEMPLATE_TREES
+        for t in trees:
             cmd += ["-t", t]
         if self.rate_limit_rps is not None:
             cmd += ["-rate-limit", str(self.rate_limit_rps)]
@@ -2621,6 +2625,8 @@ class DeepScanner:
                  auth_headers: dict[str, str] | None = None,
                  in_scope_hosts: Iterable[str] | None = None,
                  no_write_methods: bool = False,
+                 exclude_finding_signals: Iterable[str] | None = None,
+                 nuclei_exclude_trees: Iterable[str] | None = None,
                  progress=None) -> None:
         self.concurrency = concurrency
         self.timeout = timeout
@@ -2639,6 +2645,14 @@ class DeepScanner:
         # write-capable probes (TomcatFingerprint PUT, file-upload, future
         # state-modifying probes) skip the modification step.
         self.no_write_methods = no_write_methods
+        # Out-of-scope finding suppression. Compiled once; applied as a
+        # post-probe filter so findings the program can't accept never
+        # reach the report writer. Default empty = no suppression.
+        self._exclude_signal_res = [
+            re.compile(p) for p in (exclude_finding_signals or [])
+        ]
+        # Per-program nuclei tree exclusions — propagated to OwaspVulnsProbe.
+        self.nuclei_exclude_trees = frozenset(nuclei_exclude_trees or [])
         # Optional human-readable progress reporter (see src/progress.py).
         self.progress = progress
 
@@ -2660,11 +2674,33 @@ class DeepScanner:
                     in_scope_hosts=self.in_scope_hosts,
                     no_write_methods=self.no_write_methods,
                 )
+                # OwaspVulnsProbe consumes nuclei_exclude_trees as a runtime
+                # override of its class-level TEMPLATE_TREES. Other probes
+                # ignore the attribute.
+                if isinstance(probe, OwaspVulnsProbe) and self.nuclei_exclude_trees:
+                    probe.template_trees_override = tuple(
+                        t for t in probe.TEMPLATE_TREES
+                        if t not in self.nuclei_exclude_trees
+                    )
                 t_start = time.monotonic()
                 if self.progress:
                     self.progress.step(cls.name, "running…")
                 try:
                     fs = await probe.run(probes)
+                    # OOS suppression — drop findings whose signal matches
+                    # any configured exclude regex BEFORE they propagate
+                    # into the report writer. Logged at INFO so the
+                    # operator can see how much was filtered per probe.
+                    if self._exclude_signal_res:
+                        before = len(fs)
+                        fs = [f for f in fs
+                              if not any(r.match(f.signal)
+                                         for r in self._exclude_signal_res)]
+                        if before != len(fs):
+                            log.info("probe findings suppressed (OOS filter)",
+                                     probe=cls.name,
+                                     suppressed=before - len(fs),
+                                     remaining=len(fs))
                     log.info("probe done", probe=cls.name, findings=len(fs))
                     results.extend(fs)
                     if self.progress:
