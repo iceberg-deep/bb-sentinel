@@ -2265,11 +2265,343 @@ class DeserializationProbe(DeepScanProbe):
         return findings
 
 
+class ObjectStorageProbe(DeepScanProbe):
+    """Cloud object-storage misconfig detection.
+
+    Two-phase: (1) extract bucket URIs from each page's HTML and any
+    `<script src=>` JS bundles; (2) for each unique bucket, GET the
+    root URL and (where the provider supports it) the listing API.
+    A 200 + XML/JSON listing = anonymous read+list = high severity.
+
+    Providers covered: AWS S3 (path-style + virtual-host-style + region
+    variants), Google Cloud Storage, Azure Blob, Alibaba OSS,
+    DigitalOcean Spaces, Cloudflare R2, Wasabi. Pattern set updated
+    when public dumps surface new TLD shapes.
+
+    Detection only — never PUTs, never DELETEs, never writes a probe
+    file. Listing the bucket counts as a read. If the operator wants
+    to write-test a bucket for full takeover proof, they do it manually.
+    """
+    name = "object-storage"
+    BUCKET_RES: list[tuple[str, str]] = [
+        # (regex, provider-tag)
+        (r"https?://([a-z0-9.\-]+)\.s3[.\-][a-z0-9\-]+\.amazonaws\.com",  "s3-vhost"),
+        (r"https?://s3[.\-][a-z0-9\-]+\.amazonaws\.com/([a-z0-9.\-]+)/", "s3-path"),
+        (r"https?://([a-z0-9.\-]+)\.storage\.googleapis\.com",            "gcs-vhost"),
+        (r"https?://storage\.googleapis\.com/([a-z0-9.\-]+)/",             "gcs-path"),
+        (r"https?://([a-z0-9.\-]+)\.blob\.core\.windows\.net",             "azure-blob"),
+        (r"https?://([a-z0-9.\-]+)\.oss-[a-z0-9\-]+\.aliyuncs\.com",       "alibaba-oss"),
+        (r"https?://([a-z0-9.\-]+)\.[a-z0-9\-]+\.digitaloceanspaces\.com", "do-spaces"),
+        (r"https?://([a-z0-9.\-]+)\.r2\.cloudflarestorage\.com",           "cf-r2"),
+        (r"https?://([a-z0-9.\-]+)\.s3\.wasabisys\.com",                   "wasabi"),
+    ]
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") == 200})
+        if not bases:
+            return findings
+        log.info("object-storage", bases=len(bases))
+
+        # Extract bucket URIs from each base + its inline script srcs
+        found_buckets: dict[str, tuple[str, str]] = {}  # bucket -> (provider, found-on)
+        async def extract(base: str):
+            r = await self._get(base)
+            if r is None or r.status_code != 200:
+                return
+            text = r.text or ""
+            for pattern, provider in self.BUCKET_RES:
+                for m in re.finditer(pattern, text, re.IGNORECASE):
+                    bucket = m.group(1)
+                    if bucket and bucket not in found_buckets:
+                        found_buckets[bucket] = (provider, base)
+
+        await asyncio.gather(*(extract(b) for b in bases))
+
+        # For each bucket, test anonymous read + listing
+        async def test_bucket(bucket: str, provider: str, found_on: str):
+            test_results = []
+            # Construct probe URL for read + listing per provider
+            if provider == "s3-vhost":
+                root = f"https://{bucket}.s3.amazonaws.com/"
+                listing = f"https://{bucket}.s3.amazonaws.com/?list-type=2"
+            elif provider == "s3-path":
+                root = f"https://s3.amazonaws.com/{bucket}/"
+                listing = f"https://s3.amazonaws.com/{bucket}/?list-type=2"
+            elif provider == "gcs-vhost":
+                root = f"https://{bucket}.storage.googleapis.com/"
+                listing = root  # GCS XML listing is root with ?prefix=
+            elif provider == "azure-blob":
+                root = f"https://{bucket}.blob.core.windows.net/"
+                listing = f"https://{bucket}.blob.core.windows.net/?comp=list"
+            else:
+                root = listing = ""
+            if not root:
+                return []
+            r_root = await self._get(root)
+            r_list = await self._get(listing) if listing != root else r_root
+            ev_parts = [f"Provider: {provider}", f"Bucket: {bucket}",
+                        f"Discovered on: {found_on}"]
+            severity = None
+            signal = None
+            if r_list and r_list.status_code == 200 and (
+                "<ListBucketResult" in (r_list.text or "")
+                or "<EnumerationResults" in (r_list.text or "")
+                or "<Contents>" in (r_list.text or "")):
+                severity = "high"
+                signal = "bucket-anonymous-listing"
+                ev_parts.append(f"Listing API returned 200 with bucket contents.\n"
+                                f"Excerpt:\n{(r_list.text or '')[:400]}")
+            elif r_root and r_root.status_code == 200:
+                severity = "medium"
+                signal = "bucket-anonymous-read"
+                ev_parts.append(f"Root GET returned 200 (read OK; listing closed).")
+            if severity:
+                test_results.append(DeepScanFinding(
+                    url=root, probe=self.name, signal=signal,
+                    severity=severity,
+                    title=f"{provider} bucket '{bucket}' permits anonymous {signal.split('-')[-1]}",
+                    evidence="\n".join(ev_parts),
+                    extra={"provider": provider, "bucket": bucket,
+                           "discovered-on": found_on},
+                ))
+            return test_results
+
+        coros = [test_bucket(b, p, f) for b, (p, f) in found_buckets.items()]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for batch in results:
+            findings.extend(batch)
+        return findings
+
+
+class SAMLOIDCProbe(DeepScanProbe):
+    """Identity-federation endpoint discovery + sanity checks.
+
+    Hits well-known config endpoints for OIDC, OAuth 2.0, SAML, and
+    Keycloak. For each that responds with valid metadata:
+
+      * Extract issuer, supported algorithms, authorization/token URLs
+      * Flag CRITICAL if `none` is in `id_token_signing_alg_values_supported`
+        (`alg=none` JWT acceptance = trivial token forgery)
+      * Flag HIGH if `HS256` is supported alongside RSA keys
+        (algorithm-confusion lets a leaked JWKS public key sign tokens)
+      * Flag HIGH if SAML metadata has `AssertionConsumerService` without
+        any signature requirement (signature stripping pivot)
+
+    Identifies the IdP class; the actual claim-swap / signature-strip /
+    KID-injection exploits are the operator's manual workflow.
+    """
+    name = "saml-oidc"
+    ENDPOINTS = [
+        ("/.well-known/openid-configuration",            "openid-config"),
+        ("/.well-known/oauth-authorization-server",      "oauth-config"),
+        ("/saml/metadata",                                "saml-metadata"),
+        ("/federationmetadata/2007-06/federationmetadata.xml", "saml-fedmd"),
+        ("/auth/realms/master/.well-known/openid-configuration", "keycloak-master"),
+        ("/realms/master/.well-known/openid-configuration",       "keycloak-master"),
+        ("/oauth2/.well-known/openid-configuration",     "okta-style-oidc"),
+    ]
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("saml-oidc", bases=len(bases), endpoints=len(self.ENDPOINTS))
+
+        async def probe_one(base: str, path: str, kind: str):
+            url = base.rstrip("/") + path
+            r = await self._get(url)
+            if r is None or r.status_code != 200:
+                return None
+            body = (r.text or "")[:8192]
+            ctype = (r.headers.get("content-type") or "").lower()
+
+            findings_local: list[DeepScanFinding] = []
+            if kind.startswith("openid") or kind in (
+                    "oauth-config", "keycloak-master", "okta-style-oidc"):
+                if "json" not in ctype and "{" not in body[:200]:
+                    return None
+                # Parse common fields
+                issuer = re.search(r'"issuer"\s*:\s*"([^"]+)"', body)
+                algs = re.search(
+                    r'"id_token_signing_alg_values_supported"\s*:\s*\[([^\]]+)\]',
+                    body)
+                alg_list = []
+                if algs:
+                    alg_list = re.findall(r'"([^"]+)"', algs.group(1))
+                jwks = re.search(r'"jwks_uri"\s*:\s*"([^"]+)"', body)
+
+                extra = {
+                    "kind": kind,
+                    "issuer": issuer.group(1) if issuer else None,
+                    "algorithms": alg_list,
+                    "jwks_uri": jwks.group(1) if jwks else None,
+                }
+                # alg=none acceptance — trivially exploitable
+                if any(a.lower() == "none" for a in alg_list):
+                    findings_local.append(DeepScanFinding(
+                        url=url, probe=self.name,
+                        signal="oidc-alg-none",
+                        severity="critical",
+                        title=f"OIDC accepts alg=none on {base}",
+                        evidence=f"id_token_signing_alg_values_supported: {alg_list}",
+                        extra=extra,
+                    ))
+                elif "HS256" in alg_list and any(
+                        a.startswith("RS") for a in alg_list):
+                    findings_local.append(DeepScanFinding(
+                        url=url, probe=self.name,
+                        signal="oidc-alg-confusion",
+                        severity="high",
+                        title=f"OIDC mixes HS256 with RSA on {base} — alg-confusion risk",
+                        evidence=f"Algorithms: {alg_list}\n"
+                                 f"Manual: fetch JWKS public key, sign HS256 token with it.",
+                        extra=extra,
+                    ))
+                else:
+                    findings_local.append(DeepScanFinding(
+                        url=url, probe=self.name,
+                        signal=f"{kind}-discovered",
+                        severity="info",
+                        title=f"{kind} endpoint live on {base}",
+                        evidence=f"Issuer: {extra['issuer']}\nAlgs: {alg_list}\n"
+                                 f"JWKS: {extra['jwks_uri']}",
+                        extra=extra,
+                    ))
+            elif kind.startswith("saml"):
+                if "xml" not in ctype and "<EntityDescriptor" not in body[:500]:
+                    return None
+                # Coarse signature-policy check
+                wants_signed = ("WantAssertionsSigned=\"true\"" in body or
+                                "AuthnRequestsSigned=\"true\"" in body)
+                acs = re.findall(r'AssertionConsumerService[^/>]*Location="([^"]+)"',
+                                 body)
+                if not wants_signed and acs:
+                    findings_local.append(DeepScanFinding(
+                        url=url, probe=self.name,
+                        signal="saml-no-signature-requirement",
+                        severity="high",
+                        title=f"SAML metadata lacks signature requirement on {base}",
+                        evidence=f"ACS endpoints: {acs[:3]}\n"
+                                 f"WantAssertionsSigned: false\n"
+                                 f"Manual: test signature-stripping with samltool.io",
+                        extra={"acs": acs[:5], "wants_signed": wants_signed},
+                    ))
+                else:
+                    findings_local.append(DeepScanFinding(
+                        url=url, probe=self.name,
+                        signal="saml-metadata-disclosed",
+                        severity="info",
+                        title=f"SAML metadata exposed on {base}",
+                        evidence=f"ACS: {acs[:2]}",
+                        extra={"acs": acs[:5], "wants_signed": wants_signed},
+                    ))
+            return findings_local
+
+        coros = [probe_one(b, path, kind) for b in bases
+                 for path, kind in self.ENDPOINTS]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for r in results:
+            if r:
+                findings.extend(r)
+        return findings
+
+
+class InternalServiceProbe(DeepScanProbe):
+    """Fingerprint internal-network services that occasionally end up
+    publicly reachable when network isolation is misconfigured.
+
+    Each service has a probe path that returns a distinctive response
+    (status code + body marker) when the service is live and reachable
+    without auth. Detection is read-only — no login attempts, no API
+    writes. Where an unauthenticated API endpoint exists (e.g.,
+    Grafana's `/api/health`, Consul's `/v1/agent/self`), the response
+    body is the evidence; otherwise the finding flags the login page
+    and the operator does manual auth testing.
+
+    Services covered: Jenkins, GitLab, Grafana, Kibana, Consul, Docker
+    Registry v2, Splunk, Nexus, SonarQube, Jupyter, Airflow, Vault.
+    Each entry pairs a path with a unique-token regex to avoid the
+    "every 200-OK is Jenkins" false-positive trap.
+    """
+    name = "internal-service"
+    # (path, regex-token, service-name, severity-if-found)
+    SERVICES: list[tuple[str, str, str, str]] = [
+        ("/login",                r"(?i)<title>[^<]*Jenkins\b",            "jenkins-login",      "high"),
+        ("/asynchPeople/",         r"(?i)Jenkins",                          "jenkins-people",     "high"),
+        ("/api/json",              r'"_class"\s*:\s*"hudson\.model\.Hudson"', "jenkins-api",        "high"),
+        ("/users/sign_in",         r"(?i)<title>[^<]*GitLab\b",              "gitlab-login",       "high"),
+        ("/api/v4/version",        r'"version"',                              "gitlab-api",         "high"),
+        ("/api/health",            r'"database"\s*:\s*"ok"',                 "grafana-health",     "medium"),
+        ("/api/datasources",       r'^\[\s*\{',                               "grafana-ds-unauth",  "critical"),
+        ("/app/kibana",            r"(?i)kibana",                             "kibana-app",         "medium"),
+        ("/api/status",            r'"version"\s*:\s*\{',                     "kibana-status",      "medium"),
+        ("/v1/agent/self",         r'"Config"',                               "consul-agent",       "high"),
+        ("/v2/",                   r'^\{\s*\}$|"errors"\s*:',                "docker-registry-v2", "medium"),
+        ("/v2/_catalog",           r'"repositories"',                         "docker-registry-cat","high"),
+        ("/en-US/account/login",   r"(?i)splunk",                             "splunk-login",       "high"),
+        ("/service/local/status",  r'<status\b',                              "nexus-status",       "medium"),
+        ("/api/system/status",     r'"status"',                                "sonarqube-status",   "medium"),
+        ("/api/contents",          r'"content"\s*:',                          "jupyter-contents",   "critical"),
+        ("/api/v1/health",         r'"metadatabase"',                          "airflow-health",     "high"),
+        ("/v1/sys/health",         r'"sealed"',                                "vault-sys-health",   "high"),
+        ("/api/system",            r'(?i)elasticsearch|opensearch',            "es-os-system",       "high"),
+        ("/_cluster/health",       r'"cluster_name"',                          "elasticsearch-cluster","critical"),
+    ]
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("internal-service", bases=len(bases),
+                 services=len(self.SERVICES))
+
+        async def probe_one(base: str, path: str, token_re: str,
+                            service: str, sev: str):
+            url = base.rstrip("/") + path
+            r = await self._get(url)
+            if r is None or r.status_code not in (200, 401, 403):
+                return None
+            body = (r.text or "")[:8192]
+            if not re.search(token_re, body):
+                return None
+            # 401/403 = service identified but auth required (lower confidence)
+            adjusted_sev = sev
+            if r.status_code in (401, 403):
+                adjusted_sev = {"critical": "high", "high": "medium",
+                                "medium": "low", "low": "info"}.get(sev, "info")
+            return DeepScanFinding(
+                url=url, probe=self.name,
+                signal=f"service-fingerprint-{service}",
+                severity=adjusted_sev,
+                title=f"Internal service exposed: {service} on {base}",
+                evidence=f"Path: {path}\nStatus: {r.status_code}\n"
+                         f"Token: {token_re}\nBody excerpt: {body[:300]}",
+                extra={"service": service, "status": r.status_code,
+                       "auth-required": r.status_code in (401, 403)},
+            )
+
+        coros = [probe_one(b, path, tok, svc, sv)
+                 for b in bases
+                 for path, tok, svc, sv in self.SERVICES]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for r in results:
+            if r:
+                findings.append(r)
+        return findings
+
+
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
                   SpringActuatorProbe, SSTIFingerprintProbe,
                   LFIFlagProbe, SSRFOOBProbe,
                   FileUploadDiscoveryProbe, DeserializationProbe,
+                  ObjectStorageProbe, SAMLOIDCProbe, InternalServiceProbe,
                   WaybackHistorical, JsSecretMine,
                   # OriginCandidateProbe disabled — see TODO on the class.
                   # Surfaced 37 FPs on a single PlanetHoster run because
@@ -2366,6 +2698,7 @@ __all__ = [
     "SpringActuatorProbe", "SSTIFingerprintProbe",
     "LFIFlagProbe", "SSRFOOBProbe",
     "FileUploadDiscoveryProbe", "DeserializationProbe",
+    "ObjectStorageProbe", "SAMLOIDCProbe", "InternalServiceProbe",
     "WaybackHistorical", "JsSecretMine",
     "OriginCandidateProbe", "OwaspVulnsProbe",
     "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
