@@ -38,3 +38,6 @@ data/
 
 # Bounty-targets dump cache (re-derivable, 24h TTL)
 data/bounty-targets-cache/
+
+# Engagement context (lives in the private bb-sentinel-notes repo; symlinked here)
+/CLAUDE.md
