@@ -244,12 +244,46 @@ class ProgramScanner:
             r = extract_registrable_domain(h)
             if r and r not in original_roots:
                 novel_roots.add(r)
+
+        # Pre-filter novel roots through the program's scope rules.
+        # Without this, a SAN-listed IdP redirect (e.g.,
+        # microsoftonline.com on an SSO chain) becomes a novel root
+        # and subfinder/crt.sh burn time enumerating someone else's
+        # entire surface. Downstream scope filter would drop the
+        # results anyway, but pre-filtering at the SEED level saves
+        # the enumeration cost.
+        in_scope_novel: set[str] = set()
+        try:
+            from .scope import InscopeFilter
+            inscope_path = None
+            # Best-effort: find the scope file from any of the loaded programs
+            # whose seed roots overlap with these novel roots' parents.
+            # Falls back to no-filter if we can't determine.
+            for p in self.app.programs.values():
+                if p.inscope_config and any(
+                        extract_registrable_domain(d) in original_roots
+                        for d in p.domains):
+                    inscope_path = p.inscope_config
+                    break
+            if inscope_path:
+                sf = InscopeFilter(scope_file=inscope_path)
+                kept_novel, _ = await sf.filter(sorted(novel_roots))
+                in_scope_novel = set(kept_novel)
+            else:
+                in_scope_novel = novel_roots
+        except Exception as e:
+            log.warning("novel-root scope pre-filter failed; using all",
+                        error=str(e))
+            in_scope_novel = novel_roots
+
         if novel_roots:
             log.info("novel roots discovered via tls-san",
-                     count=len(novel_roots),
-                     sample=sorted(novel_roots)[:10])
+                     total=len(novel_roots),
+                     in_scope=len(in_scope_novel),
+                     out_of_scope=len(novel_roots) - len(in_scope_novel),
+                     sample=sorted(in_scope_novel)[:10])
 
-        augmented_seeds = sorted(original_roots | novel_roots)
+        augmented_seeds = sorted(original_roots | in_scope_novel)
         tasks = [
             self.subfinder.discover(augmented_seeds),
             self.assetfinder.discover(augmented_seeds),
