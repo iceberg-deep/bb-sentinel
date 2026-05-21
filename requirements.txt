@@ -9,3 +9,4 @@ alembic>=1.13
 tenacity>=8.2
 structlog>=24.1
 python-dateutil>=2.9
+Jinja2>=3.1

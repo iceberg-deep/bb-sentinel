@@ -377,6 +377,35 @@ bb-sentinel report --program evilcorp --min-severity-main high
 - **Appendix A** — info-tier findings the operator can skip
 - **Appendix B** — scan methodology (tools, rate limit, auth status)
 
+### Program-format submission template
+
+`templates/findings/bugcrowd-submission.md.j2` is a standalone
+per-finding template that wraps a `ReportFinding` in the
+Bugcrowd-style submission shape (Vulnerability Title → Severity →
+Affected URL → Steps to Reproduce → Proof of Concept → Impact →
+Remediation → Researcher attestation). It's a *structural placeholder*
+— programs that puvendor-bh their own `submission-template.md` in the
+brief's Resources tab will have slightly different section ordering,
+wording, or required fields (e.g., Bugcrowd's VRT category, CVSS
+vector). Copy the program-specific headers in to make it byte-accurate.
+
+Render outside the main report pipeline (one finding at a time, for
+direct paste into the submission form):
+
+```python
+from jinja2 import Environment, FileSystemLoader
+env = Environment(loader=FileSystemLoader("templates/findings"))
+tmpl = env.get_template("bugcrowd-submission.md.j2")
+print(tmpl.render(finding=f, repro_curl=f.reproduction_curl(),
+                  bugcrowd_username="your-name",
+                  rate_limit_rps=5))
+```
+
+The attestation block at the bottom captures the common program
+requirements (rate limit honored, custom header sent, no customer
+data accessed); update the placeholders if the program's brief
+demands different wording.
+
 ### Per-class templates
 
 Each finding signal dispatches to a Jinja2 template in
