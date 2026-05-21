@@ -81,3 +81,12 @@
 ^sitepixel\.dev\.blis\.com$
 ^wiki\.atom\-lens\.com$
 ^wmaudience\.com$
+
+# --- INTERNAL CORPORATE-NAMED ZONES ---
+# The brief states: "certain internal corporate network domains, such as
+# *.internal.t-mobile.com and *.unix.gsm1900.org may be publicly accessible
+# to facilitate specific business functions." Submissions on these qualify
+# under the Corporate Network Access category if reachable + vulnerable.
+# (internal.t-mobile.com is already covered by (^|\.)t\-mobile\.com$ above.)
+(^|\.)gsm1900\.org$
+(^|\.)unix\.gsm1900\.org$
