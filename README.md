@@ -140,7 +140,13 @@ cp config/global.example.yaml   config/global.yaml
 git clone https://github.com/<your-handle>/bb-sentinel.git
 cd bb-sentinel
 pip install -r requirements.txt
-# external tools needed on PATH: subfinder, assetfinder, httpx, nuclei, inscope
+# external tools needed on PATH: subfinder, assetfinder, httpx, nuclei
+# scope filtering is now native Python — `inscope` is no longer required
+
+# One-time: install nuclei's template DB (~5000 templates, ~250 MB).
+# Without this step, OwaspVulnsProbe and nuclei tech-detect return zero
+# matches with a "no templates" warning.
+nuclei -update-templates
 ```
 
 ### Project layout
@@ -153,9 +159,9 @@ bb-sentinel/
 │   ├── config.py        YAML loader with env-var expansion
 │   ├── database.py      SQLAlchemy 2.0 async models
 │   ├── compliance.py    rules-text pre-flight (headless-rendered)
-│   ├── scope.py         wrapper around tomnomnom/inscope
+│   ├── scope.py         native-Python scope-regex filter (tomnomnom-format .scope files)
 │   ├── scoring.py       priority-score multiplier model
-│   ├── rocks.py         9-probe deep-scan toolkit
+│   ├── rocks.py         18-probe deep-scan toolkit
 │   ├── report.py        Markdown + PDF report generator (Jinja2)
 │   ├── webhooks.py      async webhook dispatch
 │   ├── cli.py           management CLI
