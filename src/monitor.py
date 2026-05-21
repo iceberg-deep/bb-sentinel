@@ -158,6 +158,52 @@ class ProgramScanner:
                 probes = await self.httpx.probe(to_probe) if to_probe else []
             stats.live_probes = len(probes)
 
+            # 4b) Redirect-feedback discovery — capture the `Location` host
+            # from every 3xx response, scope-filter, persist as new assets,
+            # and re-probe in this same scan iteration. Surfaces hosts that
+            # don't appear in CT logs / SAN lists because they're only
+            # reachable via the redirect chain (e.g., the canonical name
+            # behind a CDN's redirect tier). Single iteration only — no
+            # recursion, no infinite-loop risk if a chain points back at
+            # itself.
+            from urllib.parse import urlparse
+            redirect_dests: set[str] = set()
+            for p in probes:
+                loc = (p.raw or {}).get("location")
+                if not loc:
+                    continue
+                netloc = urlparse(loc).netloc.split(":")[0].lower()
+                if netloc and netloc not in to_probe:
+                    redirect_dests.add(netloc)
+            if redirect_dests:
+                kept_dests, _ = await scope.filter(sorted(redirect_dests))
+                if kept_dests:
+                    new_via_redirect = await self.db.add_assets(
+                        program.id, kept_dests, source="redirect-feedback"
+                    )
+                    if prog:
+                        prog.info(
+                            f"    redirect-feedback: {len(kept_dests)} new hosts "
+                            f"surfaced via Location header (of {len(redirect_dests)} dests; "
+                            f"{len(redirect_dests) - len(kept_dests)} OOS)"
+                        )
+                    log.info("redirect-feedback discovery",
+                             dests_total=len(redirect_dests),
+                             in_scope=len(kept_dests),
+                             newly_persisted=len(new_via_redirect))
+                    # Re-probe just the newly-surfaced destinations
+                    if new_via_redirect:
+                        followup = sorted({a.hostname for a in new_via_redirect})
+                        followup_probes = await self.httpx.probe(followup)
+                        probes.extend(followup_probes)
+                        stats.live_probes = len(probes)
+                        stats.new_hosts += len(new_via_redirect)
+                        if prog:
+                            prog.info(
+                                f"    redirect-feedback: {len(followup_probes)}"
+                                f" of {len(followup)} live after re-probe"
+                            )
+
             # 5) Optional nuclei tech enrichment for new/interesting probes.
             # nuclei timeouts / failures must NOT kill the scan — losing the
             # httpx probes because the *enrichment* step failed is the worst
