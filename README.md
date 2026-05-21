@@ -31,7 +31,10 @@ ones — surfacing report-ready findings while you sleep.
 ## What it does
 
 - **Discovers attack surface** — `subfinder`, `assetfinder`, `crt.sh`,
-  `httpx`, `nuclei` orchestrated against your program domains
+  `tls-san` (mines `subject_an` from each seed's TLS cert — typically 50–200
+  SANs per CDN-fronted host, surfacing assets that don't appear in CT
+  logs or passive DNS dumps), `httpx`, `nuclei` orchestrated against
+  your program domains
 - **Diffs against a baseline** — PostgreSQL/SQLite state tracks every
   asset, surfaces new appearances
 - **Scores findings** — multi-tier multiplier model (URL keywords, auth
