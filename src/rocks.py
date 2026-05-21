@@ -261,7 +261,8 @@ class DeepScanProbe:
     def __init__(self, client: httpx.AsyncClient, semaphore: asyncio.Semaphore,
                  rate_limit_rps: int | None = None,
                  auth_headers: dict[str, str] | None = None,
-                 in_scope_hosts: frozenset[str] | None = None) -> None:
+                 in_scope_hosts: frozenset[str] | None = None,
+                 no_write_methods: bool = False) -> None:
         self.client = client
         self.sem = semaphore
         # Per-program outbound RPS cap. Probes that shell out to subprocess
@@ -274,6 +275,13 @@ class DeepScanProbe:
         # js-mine / cors / etc.
         self.auth_headers = auth_headers or {}
         self.in_scope_hosts = in_scope_hosts or frozenset()
+        # Engagement guardrail: when true, this probe MUST NOT send any
+        # request that modifies remote state (PUT/POST/DELETE/PATCH).
+        # Subclasses that perform write-probes check this flag and either
+        # skip the write step entirely or downgrade to read-only behavior.
+        # Set per-program via ProgramConfig.no_write_methods — required
+        # for programs whose ToS bans data modification (ban risk).
+        self.no_write_methods = no_write_methods
 
     def _headers_for(self, url: str) -> dict[str, str]:
         """Return auth headers iff the URL's host is in scope; else empty dict.
@@ -589,9 +597,21 @@ class TomcatFingerprint(DeepScanProbe):
         fp_results = await asyncio.gather(*(fingerprint(b) for b in bases))
         fp_results = [r for r in fp_results if r]
 
-        # 2) For confirmed-Tomcat hosts, also check PUT
-        put_results = await asyncio.gather(*(check_put(b) for b, _ in fp_results))
-        put_map = {b: info for b, info in put_results}
+        # 2) For confirmed-Tomcat hosts, also check PUT — UNLESS the program
+        # has no_write_methods set. The PUT-probe writes a sentinel file
+        # (/bb-sentinel-write-probe-DELETE-ME.txt) and DELETEs it after
+        # verification; on programs whose ToS bans data modification (e.g.
+        # T-Mobile's Vistar/Blis "do not modify any data within customer
+        # accounts" clause), even the transient write is unacceptable —
+        # violation results in a platform ban. Version disclosure / CVE
+        # cross-reference still runs from the /docs/ fingerprint.
+        if self.no_write_methods:
+            log.info("tomcat-put-probe skipped: no_write_methods guard",
+                     probe=self.name, hosts=len(fp_results))
+            put_map: dict[str, dict] = {}
+        else:
+            put_results = await asyncio.gather(*(check_put(b) for b, _ in fp_results))
+            put_map = {b: info for b, info in put_results}
 
         for base, version in fp_results:
             put_info = put_map.get(base, {})
@@ -1509,6 +1529,7 @@ class DeepScanner:
                  rate_limit_rps: int | None = None,
                  auth_headers: dict[str, str] | None = None,
                  in_scope_hosts: Iterable[str] | None = None,
+                 no_write_methods: bool = False,
                  progress=None) -> None:
         self.concurrency = concurrency
         self.timeout = timeout
@@ -1523,6 +1544,10 @@ class DeepScanner:
         # CDNs); subprocess tools (nuclei) send globally.
         self.auth_headers = auth_headers or {}
         self.in_scope_hosts = frozenset((h or "").lower() for h in (in_scope_hosts or []))
+        # Engagement-level write guardrail. Propagated to every probe so
+        # write-capable probes (TomcatFingerprint PUT, file-upload, future
+        # state-modifying probes) skip the modification step.
+        self.no_write_methods = no_write_methods
         # Optional human-readable progress reporter (see src/progress.py).
         self.progress = progress
 
@@ -1542,6 +1567,7 @@ class DeepScanner:
                     rate_limit_rps=self.rate_limit_rps,
                     auth_headers=self.auth_headers,
                     in_scope_hosts=self.in_scope_hosts,
+                    no_write_methods=self.no_write_methods,
                 )
                 t_start = time.monotonic()
                 if self.progress:

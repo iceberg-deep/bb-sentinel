@@ -184,12 +184,44 @@ programs:
       Authorization: "Bearer ${EVILCORP_API_TOKEN}"
       Cookie: "session=${EVILCORP_SESSION}"
 
+    # Engagement guardrails — see below
+    no_write_methods: false   # disable PUT/POST/DELETE/PATCH probes
+    rocks_enabled: true       # set false for discovery-only profiles
+
     scan_frequency: 1h
 
     webhooks:
       - url: https://hooks.slack.com/services/...
         priority_threshold: 10.0
 ```
+
+#### Engagement guardrails
+
+Two flags gate the more invasive parts of the pipeline. Both default to
+the most-permissive value, but several programs *require* the stricter
+setting and silent compliance is on the operator.
+
+**`no_write_methods: true`** — disables every probe that sends a
+state-modifying HTTP method. Today that's TomcatFingerprint's PUT-probe
+(it writes `/bb-sentinel-write-probe-DELETE-ME.txt` to test
+CVE-2025-24813's precondition, then DELETEs it); the FileUploadDiscovery
+probe's active upload step; and any future write-method probe is
+required to honor the flag. Use on programs whose terms ban data
+modification — e.g. T-Mobile's Vistar/Blis clause: *"do not modify any
+data within customer accounts; modification will result in a ban from
+the platform."* Even a transient write that you immediately delete is a
+violation under that wording.
+
+**`rocks_enabled: false`** — skip the deep-scan stage entirely.
+Discovery + httpx live-host check + nuclei still run; the
+9-probe `rocks` stage is bypassed. Use for discovery-only profiles
+where you want a host inventory to manually triage before any active
+probing. Examples: freshly-discovered scopes, internal-named zones,
+programs in a quiet observation phase, or staging an engagement where
+you don't yet have approval to run deep probes.
+
+Both flags log a `[guardrail]` line at scan start so it's obvious from
+the run output which mode you're in.
 
 ### `config/global.yaml`
 
