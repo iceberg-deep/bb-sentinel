@@ -4,6 +4,7 @@ from .assetfinder import Assetfinder
 from .crtsh import CrtSh
 from .httpx import HttpxProbe, ProbeResult
 from .nuclei import NucleiTech, TechResult
+from .tls_san import TLSSan
 
 __all__ = [
     "Discoverer",
@@ -16,4 +17,5 @@ __all__ = [
     "ProbeResult",
     "NucleiTech",
     "TechResult",
+    "TLSSan",
 ]

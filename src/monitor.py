@@ -11,6 +11,7 @@ from sqlalchemy import select
 from .config import AppConfig, ProgramConfig, WebhookConfig, parse_frequency
 from .database import Asset, Database, Finding, Program, ScanRun, utcnow
 from .discovery import Assetfinder, CrtSh, DiscoveryResult, HttpxProbe, NucleiTech, Subfinder
+from .discovery.tls_san import TLSSan
 from .scope import InscopeFilter
 from .scoring import score_finding
 from .webhooks import AssetPayload, WebhookSender
@@ -54,6 +55,10 @@ class ProgramScanner:
         self.subfinder = Subfinder(binary_path=g.tool("subfinder"))
         self.assetfinder = Assetfinder(binary_path=g.tool("assetfinder"))
         self.crtsh = CrtSh(timeout=g.crtsh_timeout, user_agent=g.user_agent)
+        # TLSSan reuses the httpx binary with -tls-grab; SAN extraction
+        # from the cert chain. Per-program rate-limit + auth_headers are
+        # applied in scan() before invoking discovery (see below).
+        self.tls_san = TLSSan(binary_path=g.tool("httpx"))
         self.httpx = HttpxProbe(binary_path=g.tool("httpx"), threads=g.httpx_threads)
         self.nuclei = NucleiTech(binary_path=g.tool("nuclei"), concurrency=g.nuclei_concurrency)
 
@@ -77,6 +82,12 @@ class ProgramScanner:
                          header_names=sorted(program_cfg.auth_headers.keys()))
             self.httpx = HttpxProbe(
                 binary_path=g.tool("httpx"), threads=g.httpx_threads,
+                rate_limit_rps=program_cfg.rate_limit_rps,
+                auth_headers=program_cfg.auth_headers,
+            )
+            # Apply per-program rate + auth to the SAN-discovery httpx call
+            self.tls_san = TLSSan(
+                binary_path=g.tool("httpx"),
                 rate_limit_rps=program_cfg.rate_limit_rps,
                 auth_headers=program_cfg.auth_headers,
             )
@@ -200,10 +211,16 @@ class ProgramScanner:
             return stats
 
     async def _gather_subdomains(self, domains: list[str]) -> DiscoveryResult:
+        # Parallel: subfinder + assetfinder + crt.sh enumerate from the
+        # seed roots; tls-san reads the seeds' TLS cert SANs to surface
+        # hosts that don't appear in CT logs or passive DNS dumps. A
+        # CDN-fronted origin's shared cert commonly carries 50–200 SANs
+        # — order-of-magnitude expansion of the discovered set for free.
         tasks = [
             self.subfinder.discover(domains),
             self.assetfinder.discover(domains),
             self.crtsh.discover(domains),
+            self.tls_san.discover(domains),
         ]
         combined = DiscoveryResult()
         for res in await asyncio.gather(*tasks, return_exceptions=True):
