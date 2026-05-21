@@ -49,6 +49,19 @@ ones — surfacing report-ready findings while you sleep.
 - **Alerts on impact** — webhook delivery with severity filtering;
   thresholds gate alert noise
 
+## Companion documentation
+
+[`docs/manual-workflows.md`](docs/manual-workflows.md) — playbooks for
+the categories bb-sentinel doesn't automate: cellular auth-bypass
+testing, mobile-app dynamic analysis (Frida / Objection), IdP
+self-registration, and the manual-exploitation cheatsheets for each
+detection probe's output (ysoserial chains by gadget library,
+ysoserial.net for ViewState, SSTI engine-to-RCE map, file-upload
+bypass catalog, SAML claim swap, SSRF gadget catalog including
+cloud-metadata endpoints). Read alongside the [Rock-turning](#rock-turning-deep-scanning)
+section — `rocks.py` finds the lead, `manual-workflows.md` is the
+follow-up.
+
 ## Pipeline
 
 ```
