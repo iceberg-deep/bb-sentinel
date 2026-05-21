@@ -1509,8 +1509,268 @@ class JsSecretMine(DeepScanProbe):
 
 # -- Orchestrator -----------------------------------------------------------
 
+class SpringActuatorProbe(DeepScanProbe):
+    """Spring Boot Actuator enumeration — beyond PathSweep's single-path hit.
+
+    PathSweep flags individual exposed actuator endpoints; this probe walks
+    the whole actuator surface for each base URL, deepens each find with
+    targeted follow-ups (env-secret scan, jolokia MBean listing, info-version
+    extraction), and calibrates severity based on actual exploitability:
+
+      - heapdump exposed       → critical (heap leaks creds, sessions, keys)
+      - env with secrets       → critical (passwords/tokens in plaintext)
+      - env masked             → high (still leaks config topology)
+      - jolokia MBeans listed  → high (RCE pivot via scriptEngine MBean)
+      - mappings/loggers/trace → medium (info disclosure / log tampering)
+      - info/metrics/health    → low/info (recon value)
+
+    Detection only. We never invoke jolokia exec, never fetch heapdumps
+    (50-500 MB files), never modify logger levels.
+    """
+    name = "spring-actuator"
+    # Modern (Spring Boot 2+) and legacy (1.x) paths in one pass.
+    ACTUATOR_PATHS = [
+        ("/actuator",            "actuator-root",        "low"),
+        ("/actuator/env",        "actuator-env",         "critical"),
+        ("/actuator/heapdump",   "actuator-heapdump",    "critical"),
+        ("/actuator/jolokia",    "actuator-jolokia",     "high"),
+        ("/actuator/mappings",   "actuator-mappings",    "medium"),
+        ("/actuator/loggers",    "actuator-loggers",     "medium"),
+        ("/actuator/threaddump", "actuator-threaddump",  "medium"),
+        ("/actuator/trace",      "actuator-trace",       "medium"),
+        ("/actuator/httptrace",  "actuator-trace",       "medium"),
+        ("/actuator/configprops","actuator-configprops", "high"),
+        ("/actuator/beans",      "actuator-beans",       "low"),
+        ("/actuator/info",       "actuator-info",        "info"),
+        ("/actuator/health",     "actuator-health",      "info"),
+        ("/actuator/metrics",    "actuator-metrics",     "info"),
+        # Spring Boot 1.x legacy (no /actuator prefix)
+        ("/env",       "legacy-env",       "critical"),
+        ("/heapdump",  "legacy-heapdump",  "critical"),
+        ("/jolokia",   "legacy-jolokia",   "high"),
+        ("/mappings",  "legacy-mappings",  "medium"),
+        ("/trace",     "legacy-trace",     "medium"),
+        ("/configprops","legacy-configprops","high"),
+        ("/dump",      "legacy-threaddump","medium"),
+    ]
+    # Keys whose presence in /env values indicates plaintext secret exposure.
+    # Masked-by-default envs return "******"; if we see anything else for
+    # these keys, secret is in the clear.
+    SECRET_KEYS_RE = re.compile(
+        r"(?i)(password|secret|token|api[_-]?key|access[_-]?key|"
+        r"credential|connection[_-]?string|datasource[._-]url|"
+        r"jdbc[._-]url|aws[._-]access|smtp[._-]password)"
+    )
+    # Jolokia MBeans whose presence enables known RCE chains. Detection only —
+    # we don't actually call exec on them.
+    DANGEROUS_MBEANS = (
+        "Catalina:type=Engine",                  # tomcat — code reload
+        "scriptEngineFactories",                  # JS engine via Nashorn → RCE
+        "com.sun.management:type=DiagnosticCommand",  # heap/thread/RCE-adjacent
+        "java.lang:type=Memory",                  # heap dump trigger
+        "Realm",                                  # auth realm tampering
+        "Resources",                              # JNDI lookup pivot
+    )
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("spring-actuator", bases=len(bases), paths=len(self.ACTUATOR_PATHS))
+
+        async def probe_one(base: str, path: str, signal: str, base_sev: str):
+            url = base.rstrip("/") + path
+            r = await self._get(url)
+            if r is None or r.status_code != 200:
+                return None
+            ctype = (r.headers.get("content-type") or "").lower()
+            # Filter wrappers / SPA fallbacks: real actuator returns JSON.
+            # info/health may be HTML on some configs; allow those.
+            if "json" not in ctype and signal not in (
+                    "actuator-root", "actuator-info", "actuator-health",
+                    "legacy-env"):
+                return None
+            body = r.text or ""
+            sev = base_sev
+            extra: dict = {"path": path, "content-type": ctype, "length": len(body)}
+            title = f"Spring Boot Actuator: {signal} exposed on {base}"
+
+            # Deepen specific paths
+            if signal in ("actuator-env", "legacy-env"):
+                # Scan for unmasked secret values
+                leaks = [k for k in self.SECRET_KEYS_RE.findall(body)
+                         if "******" not in body]
+                if leaks:
+                    extra["secret-key-classes"] = sorted(set(leaks))[:8]
+                    title = f"Spring Boot /env exposes plaintext secrets on {base}"
+                else:
+                    # Masked but exposed — still high (config topology leak)
+                    sev = "high"
+            elif signal in ("actuator-jolokia", "legacy-jolokia"):
+                # Follow up with /list to enumerate MBeans
+                list_url = url.rstrip("/") + "/list"
+                lr = await self._get(list_url)
+                if lr and lr.status_code == 200 and "json" in (
+                        lr.headers.get("content-type") or "").lower():
+                    body = lr.text or ""
+                    dangerous = [m for m in self.DANGEROUS_MBEANS if m in body]
+                    if dangerous:
+                        extra["dangerous-mbeans"] = dangerous
+                        title = f"Jolokia exposes dangerous MBeans on {base}"
+                    extra["mbean-list-length"] = len(body)
+            elif signal in ("actuator-heapdump", "legacy-heapdump"):
+                # Do NOT download (50-500 MB). Just flag presence + size hint.
+                extra["heapdump-content-length"] = r.headers.get("content-length")
+                title = f"Spring Boot heapdump endpoint live on {base}"
+            elif signal in ("actuator-info", "actuator-root"):
+                # Version extraction for n-day CVE matching
+                m = re.search(r'"(?:version|build\.version)"\s*:\s*"([^"]+)"', body)
+                if m:
+                    extra["spring-version"] = m.group(1)
+
+            findings_local: list[DeepScanFinding] = []
+            findings_local.append(DeepScanFinding(
+                url=url, probe=self.name, signal=signal, severity=sev,
+                title=title,
+                evidence=body[:300],
+                extra=extra,
+            ))
+            return findings_local
+
+        # Cap concurrency per base — actuator surface is ~20 paths, don't
+        # blast all at once if rate_limit_rps is set.
+        coros = [probe_one(b, p, s, sv) for b in bases
+                 for p, s, sv in self.ACTUATOR_PATHS]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for r in results:
+            if r:
+                findings.extend(r)
+        return findings
+
+
+class SSTIFingerprintProbe(DeepScanProbe):
+    """Server-Side Template Injection fingerprint via math-only payloads.
+
+    Each payload uses a multiplication that the corresponding template
+    engine evaluates server-side. If the response contains the result
+    (49) but the payload itself does not (i.e., the engine actually
+    evaluated it), we have evidence of SSTI.
+
+    Safety: payloads are arithmetic only. No filesystem access, no
+    process spawning, no environment dumping, no module/import calls.
+    This probe identifies *engine*, not exploitability — the user
+    confirms RCE manually with engine-specific gadgets.
+
+    Engines mapped:
+      {{7*7}}     Jinja2 / Twig / Liquid / Pebble
+      ${7*7}     FreeMarker / Spring EL / Velocity-as-of-2.x
+      <%=7*7%>   ERB / JSP / EJS-classic
+      #{7*7}     Ruby string interpolation / Slim
+      {{= 7*7 }} lodash / underscore _.template
+      [[7*7]]    Spring MVC SpEL alt
+      {7*7}      Smarty / Handlebars-lax
+    """
+    name = "ssti-fingerprint"
+    PAYLOADS: list[tuple[str, str, str]] = [
+        # (raw payload string, expected result substring, candidate engine)
+        ("{{7*7}}",      "49", "Jinja2/Twig/Liquid/Pebble"),
+        ("${7*7}",       "49", "FreeMarker/SpringEL/Velocity"),
+        ("<%=7*7%>",     "49", "ERB/JSP/EJS-classic"),
+        ("#{7*7}",       "49", "Ruby-interp/Slim"),
+        ("{{= 7*7 }}",   "49", "lodash/underscore"),
+        ("[[${7*7}]]",   "49", "Thymeleaf"),
+        ("{7*7}",        "49", "Smarty/Handlebars-lax"),
+    ]
+    # Param names commonly reflected in template responses. Order matters —
+    # higher-yield names first to short-circuit on rate-limited runs.
+    REFLECTED_PARAMS = (
+        "q", "search", "query", "name", "title", "message", "comment",
+        "text", "input", "value", "redirect", "url", "callback",
+        "page", "view", "id", "filter",
+    )
+    # Cap fingerprint attempts per base so a 100-host run doesn't fan out
+    # to thousands of requests. With 7 payloads × 17 params, full cross
+    # would be 119 reqs/base — cap to the first 4 params × 7 payloads = 28.
+    MAX_PARAMS_PER_BASE = 4
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("ssti-fingerprint", bases=len(bases),
+                 payloads=len(self.PAYLOADS),
+                 params_per_base=self.MAX_PARAMS_PER_BASE)
+
+        async def baseline(base: str) -> str:
+            """Fetch base URL once to know what '49' baseline-body looks like.
+            If '49' already appears (e.g., page contains the year, a count,
+            etc.), we MUST require a higher signal than just '49' appearing."""
+            r = await self._get(base)
+            return r.text if r else ""
+
+        async def fingerprint_one(base: str, param: str, payload: str,
+                                   expected: str, engine: str,
+                                   baseline_body: str):
+            # GET ?param=payload. URL-encode the payload.
+            from urllib.parse import urlencode, urlparse
+            pu = urlparse(base)
+            # Skip if base already has query — would clobber semantics
+            sep = "&" if pu.query else "?"
+            url = f"{base.rstrip('/')}/{sep[0]}{urlencode({param: payload})}"
+            # Construct properly: base + ? + encoded
+            url = f"{base.rstrip('/')}?{urlencode({param: payload})}"
+            r = await self._get(url)
+            if r is None or r.status_code >= 400:
+                return None
+            body = r.text or ""
+            # Must contain the result
+            if expected not in body:
+                return None
+            # Must NOT contain the raw payload (or engine just echoed it back)
+            if payload in body:
+                return None
+            # Result must appear with higher frequency than in baseline
+            # (defends against pages that happen to contain "49")
+            if body.count(expected) <= baseline_body.count(expected):
+                return None
+            return DeepScanFinding(
+                url=url, probe=self.name,
+                signal="ssti-engine-confirmed",
+                severity="high",
+                title=f"SSTI fingerprint: {engine} engine reflected math({payload}) on {base}",
+                evidence=(
+                    f"Payload: {payload}\n"
+                    f"Expected: {expected} appears (baseline: "
+                    f"{baseline_body.count(expected)}, response: "
+                    f"{body.count(expected)})\n"
+                    f"Response excerpt: {body[:300]}"
+                ),
+                extra={"engine-candidates": engine, "param": param,
+                       "payload": payload},
+            )
+
+        baselines = dict(zip(bases,
+                              await asyncio.gather(*(baseline(b) for b in bases))))
+        coros = []
+        for b in bases:
+            for param in self.REFLECTED_PARAMS[:self.MAX_PARAMS_PER_BASE]:
+                for payload, expected, engine in self.PAYLOADS:
+                    coros.append(fingerprint_one(
+                        b, param, payload, expected, engine, baselines[b]))
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for r in results:
+            if r:
+                findings.append(r)
+        return findings
+
+
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
+                  SpringActuatorProbe, SSTIFingerprintProbe,
                   WaybackHistorical, JsSecretMine,
                   # OriginCandidateProbe disabled — see TODO on the class.
                   # Surfaced 37 FPs on a single PlanetHoster run because
@@ -1604,6 +1864,7 @@ __all__ = [
     "DeepScanFinding", "DeepScanner", "DeepScanProbe",
     "PathSweep", "BackupFileProbe", "MethodEnumProbe",
     "Bypass403", "CorsProbe", "TomcatFingerprint",
+    "SpringActuatorProbe", "SSTIFingerprintProbe",
     "WaybackHistorical", "JsSecretMine",
     "OriginCandidateProbe", "OwaspVulnsProbe",
     "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",

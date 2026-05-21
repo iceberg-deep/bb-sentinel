@@ -261,7 +261,7 @@ stack tech or multiple signals also stack.
 ## Rock-turning (deep scanning)
 
 Where heuristic scoring tells you *where to look*, rocks tells you *what
-to report*. [`src/rocks.py`](src/rocks.py) runs nine focused probes
+to report*. [`src/rocks.py`](src/rocks.py) runs eleven focused probes
 against the live URLs found by the monitor and emits
 `DeepScanFinding` records with severity + copy-pasteable evidence.
 
@@ -272,7 +272,9 @@ against the live URLs found by the monitor and emits
 | **`method-enum`** | `OPTIONS` / `PUT` / `DELETE` / `PATCH` / `TRACE` / `PROPFIND` / `CONNECT` / `DEBUG` against each base. Flags `OPTIONS` advertising write methods, unauth PUT/DELETE writes, WebDAV exposed, TRACE-XST. |
 | **`bypass-403`** | Header tricks against every 403: `X-Forwarded-For: 127.0.0.1`, `X-Original-URL: /`, `X-HTTP-Method-Override: GET`. Status-change → finding. |
 | **`cors-reflect`** | Sends `Origin: https://evil.example.com` and `Origin: null` to every 2xx; flags credentialed reflection (high) and wildcard-with-creds (medium). |
-| **`tomcat-fingerprint`** | Detects Tomcat via `/docs/`, extracts version, cross-references the 9.x CVE band table (CVE-2025-24813 through GhostCat). Tests PUT writability non-destructively (sentinel-file PUT → GET-verify → DELETE) — writable + ≤9.0.98 satisfies the CVE-2025-24813 RCE precondition. |
+| **`tomcat-fingerprint`** | Detects Tomcat via `/docs/`, extracts version, cross-references the 9.x CVE band table (CVE-2025-24813 through GhostCat). Tests PUT writability non-destructively (sentinel-file PUT → GET-verify → DELETE) — writable + ≤9.0.98 satisfies the CVE-2025-24813 RCE precondition. Honors `no_write_methods` — skips the PUT step entirely on programs that ban data modification. |
+| **`spring-actuator`** | Beyond PathSweep's single-path hits, walks the full Spring Boot Actuator surface (`/actuator/*` + Boot-1.x legacy paths). For `/env` parses JSON and flags **unmasked** secret values (`password`/`token`/`api-key`/etc.). For `/jolokia` follows `/list` to enumerate MBeans and flags dangerous ones (scriptEngineFactories, DiagnosticCommand, Realm) — detection only, never invokes exec. For `/heapdump` flags presence + Content-Length without downloading (heap files are 50–500 MB). Extracts Spring version from `/info` for downstream n-day CVE matching. |
+| **`ssti-fingerprint`** | Math-only template-injection fingerprint. Tests seven payloads (`{{7*7}}` / `${7*7}` / `<%=7*7%>` / `#{7*7}` / `{{= 7*7 }}` / `[[${7*7}]]` / `{7*7}`) across the four most commonly-reflected GET params per base. Confirms only when (a) `49` appears in the response, (b) the raw payload does not, and (c) the result count exceeds the baseline page's count of `49`. Identifies engine (Jinja2/Twig, FreeMarker/SpEL, ERB/JSP, Thymeleaf, etc.); RCE escalation is the operator's manual step with engine-specific gadgets. |
 | **`wayback-historical`** | Pulls historical URLs from `web.archive.org/cdx` (zero traffic to the target during lookup), re-probes interesting paths (`/admin`, `/api`, `/.git`, `/dump`, …) against the live host. Surfaces forgotten endpoints normal recon misses. |
 | **`js-secret-mine`** | Fetches each 200 HTML page, follows `<script src=>`, greps JS bundles for AWS keys, GitHub PATs, JWT tokens, Google API keys, private-key blocks, `password=` / `api_key=` literals, internal-hostname / RFC1918-IP disclosures. Capped at 60 JS bundles. |
 | **`owasp-vulns`** | Runs nuclei against the live URLs with curated vuln-class template trees: SQLi, LFI, RCE, SSRF, XXE, SSTI, open-redirect, file-upload, subdomain takeover, default-logins, recent CVEs (2024-2025). Severity filter: `medium,high,critical`. |
