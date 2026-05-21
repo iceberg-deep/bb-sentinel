@@ -3,27 +3,38 @@
 # Each entry under `programs:` defines a bug-bounty target program. Domains must
 # be public, in-scope roots authorized by the program. The `inscope_config` file
 # should hold the program's scope rules (one regex/host per line) — bb-sentinel
-# pipes discovered hosts through the `inscope` CLI to enforce them.
+# pipes discovered hosts through its native scope filter to enforce them.
 
 programs:
-  example-program:
+  example-program-a:
     domains:
       - example.com
-      - example-program.com
-      - sprint.com
-    inscope_config: /app/config/example-program.inscope
+      - corp.example.com
+    inscope_config: /app/config/example-program-a.scope
     scan_frequency: 1h
+    rate_limit_rps: 5
+    auth_headers:
+      X-Bug-Bounty: "BugCrowd-<your-handle>"
     webhooks:
       - name: slack-primary
-        url: ${SLACK_WEBHOOK_EXAMPLE_PROGRAM}
+        url: ${SLACK_WEBHOOK_PRIMARY}
         priority_threshold: 7.0
 
-  att:
+  example-program-b:
     domains:
-      - att.com
-    inscope_config: /app/config/att.inscope
+      - example.org
+    inscope_config: /app/config/example-program-b.scope
     scan_frequency: 2h
+    rate_limit_rps: 3
+    auth_headers:
+      X-Bug-Bounty: "BugCrowd-<your-handle>"
+    # Optional guardrails when a program disallows write methods on certain
+    # asset tiers (e.g., customer-data-bearing systems):
+    no_write_methods: true
+    # Optional: disable active deep-scan probes entirely for discovery-only
+    # tracking of sensitive named zones.
+    rocks_enabled: false
     webhooks:
       - name: slack-secondary
-        url: ${SLACK_WEBHOOK_ATT:-}
+        url: ${SLACK_WEBHOOK_SECONDARY:-}
         priority_threshold: 5.0

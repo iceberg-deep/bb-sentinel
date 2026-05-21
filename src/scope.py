@@ -26,7 +26,7 @@ class InscopeFilter:
     flow turned out to be fragile across the two incompatible CLIs that
     ship under the `inscope` name:
       * tomnomnom/inscope (Go) — reads `.scope` from cwd, no flags
-      * <your-handle>/inscope (Python) — `inscope filter --scope PATH`,
+      * Python reimplementations — `inscope filter --scope PATH`,
         but parses *wildcard-glob* scope files, NOT regex
 
     Native Python regex matching avoids the format-mismatch foot-gun

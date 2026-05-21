@@ -4,7 +4,6 @@ config/global.yaml
 config/*.inscope
 config/*.scope
 config/*.rules.txt
-!config/example-program.scope
 
 # Engagement-specific helper scripts (per-program target curation)
 scripts/six_*.py

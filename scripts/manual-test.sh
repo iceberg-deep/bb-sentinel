@@ -12,7 +12,7 @@
 #   help                           Show this message
 #   config [program]               Show effective config for the program
 #   targets                        List current discovery output (if any)
-#   discover <seed-host>           TLS-SAN transitive (no ExampleCorp HTTP needed)
+#   discover <seed-host>           TLS-SAN transitive (no target HTTP needed)
 #                                  Falls back to https://… cert read only.
 #   probe <host>                   Single-host httpx live check (auth + rate)
 #   probe-list <file>              Multi-host httpx live check (confirms first)
@@ -20,26 +20,26 @@
 #   rocks [program]                rocks deep-scan probes
 #
 # Environment overrides:
-#   BB_PROGRAM       default program (default: example-program-internal)
+#   BB_PROGRAM       default program (default: example-program)
 #   BB_RATE          rate-limit r/s (default: 3)
-#   BB_BC_USERNAME   Bugcrowd username for X-Bug-Bounty (default: <your-handle>)
+#   BB_BC_USERNAME   Bugcrowd username for X-Bug-Bounty (default: your-handle)
 #   BB_OOB_HOST      enable SSRF OOB mode for rocks (sets BBSENTINEL_OOB_HOST)
 #   BB_PIVOT_URLS    enable SSRF internal-pivot (sets BBSENTINEL_PIVOT_URLS)
 #
 # Examples:
-#   ./scripts/manual-test.sh discover passwordreset.internal.example.com
-#   ./scripts/manual-test.sh probe papi.example.com
+#   ./scripts/manual-test.sh discover subdomain.example.com
+#   ./scripts/manual-test.sh probe api.example.com
 #   ./scripts/manual-test.sh probe-list /tmp/some-targets.txt
-#   ./scripts/manual-test.sh scan example-program-internal
-#   BB_PROGRAM=example-program-core ./scripts/manual-test.sh rocks
+#   ./scripts/manual-test.sh scan example-program
+#   BB_PROGRAM=other-program ./scripts/manual-test.sh rocks
 #
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PROGRAM="${BB_PROGRAM:-example-program-internal}"
+PROGRAM="${BB_PROGRAM:-example-program}"
 RATE="${BB_RATE:-3}"
-BC_USER="${BB_BC_USERNAME:-<your-handle>}"
+BC_USER="${BB_BC_USERNAME:-your-handle}"
 HEADER="X-Bug-Bounty: BugCrowd-${BC_USER}"
 OUTDIR="/tmp/bbs-out/$(date +%Y%m%d-%H%M%S)"
 

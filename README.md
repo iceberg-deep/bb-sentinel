@@ -332,7 +332,7 @@ engagement-specific targets stay on the operator's machine.
 | Variable | Effect | Example |
 |----------|--------|---------|
 | `BBSENTINEL_OOB_HOST` | Switches `ssrf-oob` from **heuristic** mode (passive param-flagging only) to **oob-active**: injects this host as each SSRF-prone param's value, operator confirms via their OOB listener. | `xyz.oast.fun` (interactsh) or `abc.burpcollaborator.net` |
-| `BBSENTINEL_PIVOT_URLS` | Comma-separated list of internal targets. When set **alongside** `OOB_HOST`, `ssrf-oob` enters **internal-pivot** mode — after the OOB payload, also injects each pivot URL and flags critical when the canary appears in the response. | `http://192.0.2.10/flag.txt,http://192.0.2.11/flag.txt` |
+| `BBSENTINEL_PIVOT_URLS` | Comma-separated list of internal targets. When set **alongside** `OOB_HOST`, `ssrf-oob` enters **internal-pivot** mode — after the OOB payload, also injects each pivot URL and flags critical when the canary appears in the response. | `http://192.0.2.10/flag.txt,http://192.0.2.11/flag.txt` (use the IPs the program explicitly names in its brief) |
 | `BBSENTINEL_PIVOT_CANARY` | Substring required in the response for `internal-pivot` to flag a hit. Defaults to `flag` (matches programs that use `/flag.txt`-style flag-capture targets). | `flag` (default), `root:x:0:0`, `internal-marker` |
 
 Mode auto-selection: no env → heuristic; `OOB_HOST` only → oob-active;
