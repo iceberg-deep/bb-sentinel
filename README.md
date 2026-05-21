@@ -8,13 +8,18 @@ ones — surfacing report-ready findings while you sleep.
 ## Table of contents
 
 - [What it does](#what-it-does)
+- [Companion documentation](#companion-documentation)
 - [Pipeline](#pipeline)
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Configuration](#configuration)
+  - [Engagement guardrails](#engagement-guardrails) — `no_write_methods`, `rocks_enabled`
+  - [Out-of-scope finding suppression](#out-of-scope-finding-suppression) — `exclude_finding_signals`, `nuclei_exclude_trees`
+- [Environment variables](#environment-variables) — SSRF OOB host / pivot URLs / canary
 - [Priority scoring](#priority-scoring)
-- [Rock-turning (deep scanning)](#rock-turning-deep-scanning)
+- [Rock-turning (deep scanning)](#rock-turning-deep-scanning) — 18 probes
 - [Report writing](#report-writing)
+  - [Program-format submission template](#program-format-submission-template)
 - [Authenticated probing](#authenticated-probing)
 - [Compliance pre-flight](#compliance-pre-flight)
 - [Target curation](#target-curation)
@@ -31,18 +36,40 @@ ones — surfacing report-ready findings while you sleep.
   asset, surfaces new appearances
 - **Scores findings** — multi-tier multiplier model (URL keywords, auth
   context, tech stack, ports, recency) so high-value surface bubbles up
-- **Hunts for impact** — `rocks` runs nine focused probes against live
-  URLs to find exposed `.git`/`.env`/actuator/swagger, SQLi/LFI/RCE/SSRF
-  via curated nuclei templates, subdomain takeovers, default creds,
-  Tomcat-version CVE matches, CORS misconfigs, and more
+- **Hunts for impact across 18 probes** — `rocks` covers source-control
+  / config leaks (`path-sweep`, `backup-file`, `js-secret-mine`), HTTP
+  misbehavior (`method-enum`, `bypass-403`, `cors-reflect`), framework
+  exposures (`tomcat-fingerprint`, `spring-actuator` w/ Boot 2 + Boot 1.x
+  legacy paths + Jolokia MBean enumeration), injection-class detection
+  (`ssti-fingerprint` for 7 template engines, `lfi-flag` with `/etc/passwd`
+  canary + direct `/flag.txt` reads, `ssrf-oob` with three modes including
+  out-of-band-confirmed internal-target pivot, `owasp-vulns` via nuclei),
+  data-handling vuln detection (`file-upload-discovery` finds endpoints
+  without uploading; `deserialization-markers` catches Java / .NET
+  ViewState w/o MAC / Python pickle / PHP), and infrastructure recon
+  (`object-storage` for S3/GCS/Azure/etc. anonymous read+list,
+  `saml-oidc` flagging `alg=none` and SAML sig-policy gaps,
+  `internal-service` fingerprinting 20 services like Jenkins / GitLab /
+  Grafana / Consul / Vault / Elasticsearch). See full table in
+  [Rock-turning](#rock-turning-deep-scanning).
 - **Writes the report** — `bb-sentinel report` turns scan output into
   a submission-ready Markdown + PDF document. Per-class Jinja templates
   frame impact, list triage-validation steps, and flag the common
-  downgrade traps that cause programs to close findings as informational
+  downgrade traps that cause programs to close findings as informational.
+  Optional [Bugcrowd-format per-finding template](#program-format-submission-template)
+  for direct paste into the submission form.
 - **Respects program rules** — compliance pre-flight reads each
   program's policy (with headless-rendered fallback for JS pages) and
   refuses to scan programs that prohibit automation; per-program rate
-  limits are honored across every probe
+  limits are honored across every probe. [Engagement
+  guardrails](#engagement-guardrails) `no_write_methods` and
+  `rocks_enabled` gate state-modifying probes and deep-scan stages for
+  programs with no-modification clauses or discovery-only profiles.
+- **Filters out-of-scope vuln classes** — [`exclude_finding_signals`
+  and `nuclei_exclude_trees`](#out-of-scope-finding-suppression) drop
+  reports the program closes as N/A (XSS, open-redirect, cache
+  poisoning, missing-headers, OPTIONS/TRACE, etc.) before they reach
+  the report writer or burn rate budget.
 - **Carries credentials when authorized** — auth headers propagate
   through every active layer, scope-restricted so tokens don't leak to
   third-party CDNs during JS mining
@@ -158,8 +185,17 @@ bb-sentinel compliance --program <name>
 # 4. Scan — runs discovery + scope-filter + httpx + nuclei tech-detect
 bb-sentinel scan <name> --force
 
-# 5. Deep probe — runs the 9-probe rocks toolkit against live URLs
+# 5. Deep probe — runs the 18-probe rocks toolkit against live URLs
+#    Honors per-program guardrails: `no_write_methods` (skips PUT/POST
+#    probes for no-modification programs), `rocks_enabled: false`
+#    (skips deep scan entirely — discovery-only profile).
 bb-sentinel rocks --program <name> --min-severity medium
+
+# 5a. Optional: enable SSRF out-of-band confirmation + internal pivot
+#     export BBSENTINEL_OOB_HOST=<your-collaborator-or-interactsh-host>
+#     export BBSENTINEL_PIVOT_URLS=http://10.x.y.z/flag.txt,http://10.a.b.c/flag.txt
+#     export BBSENTINEL_PIVOT_CANARY=flag
+#     (see Environment variables section)
 
 # 6. Write the report — turns rocks JSONL into a Markdown + PDF document
 bb-sentinel report --program <name>
@@ -274,6 +310,31 @@ emitted across all rocks probes.
 
 Controls database URL, log level, concurrency, tool paths. Supports
 `${VAR}` and `${VAR:-default}` env-var expansion.
+
+## Environment variables
+
+bb-sentinel reads three optional env vars at runtime to enable SSRF
+out-of-band confirmation and internal-target pivot validation. Keeping
+these out of YAML (a) avoids committing engagement-specific targets,
+(b) lets you flip the operating mode per-run without editing config,
+and (c) keeps the puvendor-bhed code a generic SSRF tool while
+engagement-specific targets stay on the operator's machine.
+
+| Variable | Effect | Example |
+|----------|--------|---------|
+| `BBSENTINEL_OOB_HOST` | Switches `ssrf-oob` from **heuristic** mode (passive param-flagging only) to **oob-active**: injects this host as each SSRF-prone param's value, operator confirms via their OOB listener. | `xyz.oast.fun` (interactsh) or `abc.burpcollaborator.net` |
+| `BBSENTINEL_PIVOT_URLS` | Comma-separated list of internal targets. When set **alongside** `OOB_HOST`, `ssrf-oob` enters **internal-pivot** mode — after the OOB payload, also injects each pivot URL and flags critical when the canary appears in the response. | `http://192.0.2.10/flag.txt,http://192.0.2.11/flag.txt` |
+| `BBSENTINEL_PIVOT_CANARY` | Substring required in the response for `internal-pivot` to flag a hit. Defaults to `flag` (matches programs that use `/flag.txt`-style flag-capture targets). | `flag` (default), `root:x:0:0`, `internal-marker` |
+
+Mode auto-selection: no env → heuristic; `OOB_HOST` only → oob-active;
+`OOB_HOST` + `PIVOT_URLS` → internal-pivot. The probe logs its active
+mode at run start.
+
+**Authorization reminder:** only set `PIVOT_URLS` to targets the
+program explicitly authorizes. ExampleCorp-style briefs that list
+specific RFC1918 IPs as bounty targets are the canonical use case.
+Pointing the pivot at arbitrary internal addresses is offensive
+hacking, not security research.
 
 ## Priority scoring
 
