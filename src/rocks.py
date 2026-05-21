@@ -2028,10 +2028,248 @@ class SSRFOOBProbe(DeepScanProbe):
         return findings
 
 
+class FileUploadDiscoveryProbe(DeepScanProbe):
+    """Surface file-upload endpoints — discovery only, never uploads.
+
+    For each live HTML page, parses `<form>` elements with
+    `enctype="multipart/form-data"` containing `<input type="file">`,
+    resolves each form's action URL, and emits a finding naming the
+    endpoint + method + field names. The operator follows up manually
+    in Burp: tries benign content with mis-declared MIME, double
+    extensions (`.php.txt`), null-byte truncation, SVG XSS, etc.
+
+    Why no active upload step: even a benign `bb-sentinel-upload-probe.txt`
+    is a state-modifying request. Some programs ban data modification
+    outright (ExampleCorp's VendorA/VendorB: platform ban for modification);
+    others accept it but the resulting file persists and pollutes the
+    target's filesystem. The probe stays passive — the lead it generates
+    is "here's an upload endpoint" and the operator does the active work.
+    """
+    name = "file-upload-discovery"
+    UPLOAD_FORM_RE = re.compile(
+        r'<form\b[^>]*\benctype\s*=\s*["\']multipart/form-data["\'][^>]*>'
+        r'(.*?)</form>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    FILE_INPUT_RE = re.compile(
+        r'<input\b[^>]*\btype\s*=\s*["\']file["\']',
+        re.IGNORECASE,
+    )
+    ACTION_RE  = re.compile(r'\baction\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+    METHOD_RE  = re.compile(r'\bmethod\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+    NAME_RE    = re.compile(r'\bname\s*=\s*["\']([^"\']*)["\']', re.IGNORECASE)
+    # Only crawl pages we already know returned HTML — skip JSON/XML/binary
+    MAX_PAGES = 80
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        # Restrict to pages plausibly HTML (status 200, Content-Type text/html)
+        html_probes = [p for p in probes
+                       if p.get("status_code") == 200
+                       and "text/html" in (p.get("content_type") or "").lower()]
+        if not html_probes:
+            return findings
+        log.info("file-upload-discovery", html_pages=len(html_probes))
+
+        from urllib.parse import urljoin
+
+        async def scan_page(base: str):
+            r = await self._get(base)
+            if r is None or r.status_code != 200:
+                return []
+            html = r.text or ""
+            results = []
+            for m in self.UPLOAD_FORM_RE.finditer(html):
+                form_body = m.group(1)
+                if not self.FILE_INPUT_RE.search(form_body):
+                    continue
+                # Find action URL — fall back to base if not specified
+                action_m = self.ACTION_RE.search(m.group(0))
+                action = action_m.group(1) if action_m else ""
+                action_url = urljoin(base, action) if action else base
+                method_m = self.METHOD_RE.search(m.group(0))
+                method = (method_m.group(1) if method_m else "POST").upper()
+                # Collect field names
+                fields = self.NAME_RE.findall(form_body)
+                results.append(DeepScanFinding(
+                    url=action_url, probe=self.name,
+                    signal="upload-endpoint",
+                    severity="medium",
+                    title=f"File upload endpoint discovered: {method} {action_url}",
+                    evidence=(
+                        f"Discovered on: {base}\n"
+                        f"Action: {action_url}\n"
+                        f"Method: {method}\n"
+                        f"Form fields: {fields}\n\n"
+                        f"Manual tests to run in Burp:\n"
+                        f"  - mis-declared MIME (text/plain claimed, .php content)\n"
+                        f"  - double extension (.php.jpg, .phtml)\n"
+                        f"  - null-byte truncation (.jpg%00.php)\n"
+                        f"  - SVG XSS payload\n"
+                        f"  - polyglot file (gif+php)\n"
+                        f"  - path-traversal in filename (../webshell.php)"
+                    ),
+                    extra={"method": method, "fields": fields,
+                           "discovered-on": base},
+                ))
+            return results
+
+        # Cap pages to scan
+        coros = [scan_page(p["url"]) for p in html_probes[:self.MAX_PAGES]]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for batch in results:
+            findings.extend(batch)
+        return findings
+
+
+class DeserializationProbe(DeepScanProbe):
+    """Detect insecure-deserialization markers — passive only.
+
+    Surfaces endpoints/cookies/responses carrying serialized objects
+    that an attacker could potentially replace with a gadget chain:
+
+      * Java serialized streams (magic bytes `AC ED 00 05`, or base64
+        prefix `rO0AB`) in cookies, response bodies, or query params
+      * .NET `__VIEWSTATE` parameter — flags if the matching
+        `__VIEWSTATEGENERATOR` cookie/field is missing (ASP.NET's
+        MAC validation indicator); MAC-less ViewState is exploitable
+        with `ysoserial.net`
+      * Python pickle magic bytes (`\\x80\\x04` opcode prefix) in
+        `application/octet-stream` responses
+      * PHP serialized notation (`s:N:"..."`, `a:N:{...}`, `O:N:"..."`)
+        in params and cookies
+
+    Detection only — emits the endpoint, the framework class, and a
+    suggested local command for the operator to run for exploitation
+    (e.g., `ysoserial -gadget CommonsCollections5 ...`). Never sends
+    gadget payloads; never modifies serialized state on the target.
+    """
+    name = "deserialization-markers"
+    JAVA_SERIAL_BIN = b"\xac\xed\x00\x05"
+    JAVA_SERIAL_B64 = "rO0AB"   # base64 of AC ED 00 05
+    PYTHON_PICKLE_PFX = b"\x80\x04"  # protocol 4
+    PHP_SERIAL_RE = re.compile(
+        r'(?:^|[^a-zA-Z])(s:\d+:"[^"]*"|a:\d+:\{|O:\d+:"[^"]*"|i:\d+;)'
+    )
+    VIEWSTATE_RE = re.compile(
+        r'name=["\']__VIEWSTATE["\']\s+value=["\']([^"\']+)["\']',
+        re.IGNORECASE,
+    )
+    VIEWSTATE_MAC_RE = re.compile(
+        r'name=["\']__VIEWSTATEGENERATOR["\']',
+        re.IGNORECASE,
+    )
+
+    async def run(self, probes: list[dict]) -> list[DeepScanFinding]:
+        findings: list[DeepScanFinding] = []
+        bases = sorted({p["url"] for p in probes
+                        if p.get("status_code") and 200 <= p["status_code"] < 400})
+        if not bases:
+            return findings
+        log.info("deserialization-markers", bases=len(bases))
+
+        async def scan(base: str):
+            r = await self._get(base)
+            if r is None:
+                return []
+            results = []
+            body_bytes = r.content or b""
+            body_text = (r.text or "")
+            ctype = (r.headers.get("content-type") or "").lower()
+
+            # Java serialized stream
+            if (self.JAVA_SERIAL_BIN in body_bytes or
+                    self.JAVA_SERIAL_B64 in body_text):
+                results.append(DeepScanFinding(
+                    url=base, probe=self.name,
+                    signal="deserialization-java",
+                    severity="high",
+                    title=f"Java serialized stream marker in response on {base}",
+                    evidence=(
+                        f"Detected magic: AC ED 00 05 (or rO0AB base64).\n"
+                        f"Content-Type: {ctype}\n"
+                        f"Manual follow-up:\n"
+                        f"  ysoserial -gadget CommonsCollections5 -formatter "
+                        f"Serialize -payload 'id' | xxd"
+                    ),
+                    extra={"content-type": ctype},
+                ))
+            # Java serialized in cookies
+            cookies = r.headers.get("set-cookie", "")
+            if self.JAVA_SERIAL_B64 in cookies:
+                results.append(DeepScanFinding(
+                    url=base, probe=self.name,
+                    signal="deserialization-java-cookie",
+                    severity="high",
+                    title=f"Java serialized stream in Set-Cookie on {base}",
+                    evidence=f"Cookie: {cookies[:300]}",
+                    extra={"cookie": cookies[:200]},
+                ))
+            # .NET ViewState
+            vs_match = self.VIEWSTATE_RE.search(body_text)
+            if vs_match:
+                has_mac = bool(self.VIEWSTATE_MAC_RE.search(body_text))
+                results.append(DeepScanFinding(
+                    url=base, probe=self.name,
+                    signal=("deserialization-viewstate-no-mac"
+                            if not has_mac else "deserialization-viewstate"),
+                    severity=("critical" if not has_mac else "medium"),
+                    title=(f"ASP.NET __VIEWSTATE on {base} — "
+                           f"{'NO MAC validator' if not has_mac else 'MAC present'}"),
+                    evidence=(
+                        f"__VIEWSTATE: {vs_match.group(1)[:80]}...\n"
+                        f"__VIEWSTATEGENERATOR present: {has_mac}\n"
+                        f"Manual follow-up:\n"
+                        f"  ysoserial.net -g TypeConfuseDelegate -f BinaryFormatter "
+                        f"-c 'whoami' --validationkey ... --validationalg HMACSHA256"
+                    ),
+                    extra={"has-mac-validator": has_mac,
+                           "viewstate-prefix": vs_match.group(1)[:40]},
+                ))
+            # Python pickle
+            if (body_bytes.startswith(self.PYTHON_PICKLE_PFX) and
+                    "octet-stream" in ctype):
+                results.append(DeepScanFinding(
+                    url=base, probe=self.name,
+                    signal="deserialization-pickle",
+                    severity="high",
+                    title=f"Python pickle stream on {base}",
+                    evidence=(
+                        f"Body starts with pickle protocol 4 magic.\n"
+                        f"Manual follow-up: craft a pickle payload with a "
+                        f"__reduce__ method that returns (os.system, ('id',))"
+                    ),
+                    extra={"content-type": ctype,
+                           "body-prefix-hex": body_bytes[:16].hex()},
+                ))
+            # PHP serialized
+            if self.PHP_SERIAL_RE.search(body_text[:8192]):
+                results.append(DeepScanFinding(
+                    url=base, probe=self.name,
+                    signal="deserialization-php",
+                    severity="medium",
+                    title=f"PHP serialized data in response on {base}",
+                    evidence=(
+                        f"Pattern matched.\n"
+                        f"Manual follow-up: identify gadget chain in app's "
+                        f"loaded classes, craft phpggc payload."
+                    ),
+                    extra={"content-type": ctype},
+                ))
+            return results
+
+        coros = [scan(b) for b in bases]
+        results = await asyncio.gather(*coros, return_exceptions=False)
+        for batch in results:
+            findings.extend(batch)
+        return findings
+
+
 DEFAULT_PROBES = (PathSweep, BackupFileProbe, MethodEnumProbe,
                   Bypass403, CorsProbe, TomcatFingerprint,
                   SpringActuatorProbe, SSTIFingerprintProbe,
                   LFIFlagProbe, SSRFOOBProbe,
+                  FileUploadDiscoveryProbe, DeserializationProbe,
                   WaybackHistorical, JsSecretMine,
                   # OriginCandidateProbe disabled — see TODO on the class.
                   # Surfaced 37 FPs on a single PlanetHoster run because
@@ -2127,6 +2365,7 @@ __all__ = [
     "Bypass403", "CorsProbe", "TomcatFingerprint",
     "SpringActuatorProbe", "SSTIFingerprintProbe",
     "LFIFlagProbe", "SSRFOOBProbe",
+    "FileUploadDiscoveryProbe", "DeserializationProbe",
     "WaybackHistorical", "JsSecretMine",
     "OriginCandidateProbe", "OwaspVulnsProbe",
     "HIGH_VALUE_PATHS", "BACKUP_SUFFIXES", "BYPASS_HEADERS", "TOMCAT9_CVE_BANDS",
