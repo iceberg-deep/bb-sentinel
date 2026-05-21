@@ -426,6 +426,8 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
     program_rate_limit = None
     program_auth: dict[str, str] = {}
     program_in_scope: list[str] = []
+    program_no_write = False
+    program_rocks_enabled = True
     if program_name:
         app = _load_app(ctx.obj["programs_path"], ctx.obj["global_path"])
         cfg = app.programs.get(program_name)
@@ -439,6 +441,13 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
             # Use domain roots as the scope-restriction list. Python rocks
             # probes only send auth headers to hosts ending in one of these.
             program_in_scope = list(cfg.domains)
+            program_no_write = cfg.no_write_methods
+            program_rocks_enabled = cfg.rocks_enabled
+            if program_no_write:
+                click.echo("[guardrail] no_write_methods: PUT/POST/DELETE/PATCH probes disabled")
+            if not program_rocks_enabled:
+                click.echo("[guardrail] rocks_enabled: false — skipping deep scan entirely")
+                return
     progress = ctx.obj.get("progress")
     if progress:
         progress.info(f"[rocks] {len(probes)} probe records loaded")
@@ -449,6 +458,7 @@ async def rocks(ctx: click.Context, from_jsonl: str | None, program_name: str | 
         concurrency=concurrency, timeout=timeout,
         rate_limit_rps=program_rate_limit,
         auth_headers=program_auth, in_scope_hosts=program_in_scope,
+        no_write_methods=program_no_write,
         progress=progress,
     )
     if progress:

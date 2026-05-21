@@ -57,6 +57,20 @@ class ProgramConfig(BaseModel):
     #     Authorization: "Bearer ${EVILCORP_API_TOKEN}"
     #     Cookie: "session=${EVILCORP_SESSION}"
     auth_headers: dict[str, str] = Field(default_factory=dict)
+    # Engagement guardrail: when true, all state-modifying probes are
+    # disabled for this program. TomcatFingerprint skips its PUT-probe
+    # branch, FileUploadDiscoveryProbe skips active upload tests, and any
+    # future probe that sends PUT/POST/DELETE checks this flag and bails.
+    # Use for programs whose ToS bans data modification (e.g. ExampleCorp's
+    # VendorA/VendorB clause: "do not modify any data within customer accounts"
+    # — violation results in platform ban, not just program removal).
+    no_write_methods: bool = False
+    # Skip the deep-scan (rocks) stage entirely. Discovery + httpx live
+    # probe still run; nuclei still runs. Use for discovery-only profiles
+    # where you want to inventory hosts and manually triage before any
+    # rocks-tier active probing — e.g. internal-named zones, freshly
+    # discovered scopes, or programs in a quiet observation phase.
+    rocks_enabled: bool = True
 
     @field_validator("domains")
     @classmethod
